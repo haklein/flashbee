@@ -28,6 +28,16 @@ last strikes.
 I²C pins (ESP32-C3): `SDA = D4 (GPIO6)`, `SCL = D5 (GPIO7)`. SPI for the
 display is configured via Setup501 in Seeed_GFX.
 
+### Extra wire: AS3935 `INT` → XIAO `D2`
+
+The Instructables assembly already asks you to cut the Grove connector
+off the module and solder direct bridges for 3V3, GND, SDA and SCL.
+**Add one more wire:** from the AS3935 module's `INT` pad to XIAO
+**D2 (GPIO4)**. This lets the firmware measure the antenna's LC-tank
+resonance and pick the correct `TUN_CAP` value automatically — without
+it, every distance reading is biased. Override the pin with
+`-DAS3935_INT_PIN=<n>` if D2 isn't convenient for your wiring.
+
 > **Safety disclaimer.** This is a hobby device. Do **not** use it as your
 > sole basis for deciding whether it is safe to be outdoors. The AS3935 is
 > a statistical single-antenna detector with ±1 bin distance uncertainty
@@ -87,6 +97,54 @@ src/main.ino            # single-file firmware
   row; the firmware keeps retrying `initAS3935()` every 3 s until
   the sensor comes back.
 
+## First-time setup — antenna calibration
+
+After the first flash, open the serial monitor before plugging in (or
+hit the reset button after plugging in) and watch for:
+
+```
+[tune] no saved antenna calibration.
+[tune] send 'tune' on serial to calibrate now.
+```
+
+Type `tune` and hit enter within the 5-second window. The firmware:
+
+1. Issues `PRESET_DEFAULT` + `CALIB_RCO` to the AS3935.
+2. Sets `DISP_LCO` bit and `LCO_FDIV = ÷128` — routes the LC-tank
+   oscillator to the AS3935 `INT` pin, divided down to ~3906 Hz.
+3. Sweeps `TUN_CAP` from 0 to 15, counting rising edges on the
+   XIAO GPIO for 200 ms per step.
+4. Picks the value closest to 3906 Hz, saves it to NVS (via
+   `Preferences`), and continues into normal detector mode with
+   that `TUN_CAP` applied.
+
+Serial output looks like:
+
+```
+TUN_CAP= 0 -> 3863 Hz (-43)
+TUN_CAP= 1 -> 3885 Hz (-21)
+TUN_CAP= 2 -> 3903 Hz  (-3)
+TUN_CAP= 3 -> 3921 Hz (+15)
+...
+best: TUN_CAP=2 @ 3903 Hz (dev -3, WITHIN TOL)
+```
+
+The screen shows a live progress bar during the sweep and a summary
+panel at the end (`TUNED` green, or `OUT OF RANGE` red if nothing on
+the sweep lands within ±3.5 %).
+
+**To re-calibrate later:** on any subsequent boot there's a 1.5-second
+window right after the AS3935 init screen where `tune` will retrigger
+the sweep. Hit reset, type `tune` on serial, done.
+
+**If the sweep fails with `NO SIGNAL` / `check INT wire`:** the
+firmware saw zero edges on `AS3935_INT_PIN`. Either the jumper from
+the AS3935 module's `INT` pad isn't connected, or it's on a different
+GPIO than D2. Without that wire the tune cannot run and the firmware
+falls back to the compile-time default (`AS3935_TUN_CAP`, 0 unless
+overridden) — the detector still works, but distance estimates will
+be whatever the out-of-the-box LC tank produces.
+
 ## Safety-critical fixes vs. the Instructables original
 
 The original sketch was reviewed twice (once by Claude, once by Codex)
@@ -111,11 +169,10 @@ is kept intact at `7707720` so the deltas are traceable. Fix commit
   and verifies `TRCO_CALIB_DONE` / `SRCO_CALIB_DONE` (bit 7) plus the
   corresponding `_NOK` bit (bit 6) in regs 0x3A/0x3B before proceeding.
 - **Antenna `TUN_CAP` was never set.** Reg 0x08 [3:0] controls the LC
-  tank trim; the factory-tuned value is board-specific. The code now
-  writes `AS3935_TUN_CAP` (default 0; override with
-  `-DAS3935_TUN_CAP=n`). Until you've trimmed your specific Grove
-  module by watching LCO on the IRQ pin (reg 0x08 bit 7 + FDIV)
-  until it's within ±3.5 % of 500 kHz, expect some residual bias.
+  tank trim; the factory-tuned value is board-specific. The firmware
+  now runs a built-in sweep (see
+  [First-time setup — antenna calibration](#first-time-setup--antenna-calibration))
+  and stores the result in NVS.
 - **Distance value `0x00` was coerced to `OVERHEAD`.** The datasheet
   only defines `0x01` (overhead) and `0x3F` (out of range); `0x00`
   is not a valid distance output. The original displayed the
@@ -162,10 +219,10 @@ is kept intact at `7707720` so the deltas are traceable. Fix commit
 All of the above are datasheet-correctness fixes — none have been
 run against a real Grove AS3935 on hardware yet. In particular:
 
-1. `AS3935_TUN_CAP` needs to be trimmed per board. The README
-   Instructables build works around this by relying on the
-   factory-default LCO frequency; measure yours before trusting
-   the distance readout.
+1. The built-in antenna tune has been compile-tested but not run
+   against a real module. Expect one round of edge-count scaling
+   corrections the first time it runs on hardware (e.g. `attachInterrupt`
+   overhead at 3.9 kHz, glitch filtering on the INT line).
 2. The reviewer critique stands that a single-antenna detector
    produces **statistical** distance to the *head of the storm*,
    not range to the individual strike that triggered the IRQ.

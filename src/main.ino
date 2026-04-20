@@ -6,6 +6,7 @@
 #include <SPI.h>
 #include <TFT_eSPI.h>
 #include <math.h>
+#include <Preferences.h>
 
 // ── Display ─────────────────────────────────────────────────────
 TFT_eSPI    tft = TFT_eSPI();
@@ -94,10 +95,36 @@ TFT_eSprite spr = TFT_eSprite(&tft);
 #define I2C_TIMEOUT_MS      50
 #define I2C_FAIL_LIMIT      8
 
+// AS3935 IRQ pin → XIAO GPIO. Required for antenna tune; a separate
+// fly-lead from the AS3935 module's INT pad to a free XIAO pin.
+// Instructables build already asks you to remove the Grove connector
+// and solder direct wires — add one more for INT.
+// Default: D2 on XIAO ESP32-C3 = GPIO4 (not used by the display).
+#ifndef AS3935_INT_PIN
+  #define AS3935_INT_PIN    4
+#endif
+
+// Antenna-tune params (datasheet §8.11, app-note AN-LDS1.1)
+// LCO routed to IRQ pin via DISP_LCO, divided by LCO_FDIV=128 so the
+// output is slow enough for attachInterrupt() on a 160 MHz MCU to
+// count reliably. Target: 500 kHz / 128 ≈ 3906 Hz, tolerance ±3.5 %.
+#define LCO_TARGET_HZ       500000UL
+#define LCO_DIV_SHIFT       7                           // 128 = 1<<7
+#define LCO_EXPECTED_HZ     (LCO_TARGET_HZ >> LCO_DIV_SHIFT)
+#define LCO_TOL_HZ          ((LCO_EXPECTED_HZ * 35) / 1000)
+#define TUNE_WINDOW_MS      200
+#define TUNE_SETTLE_MS      60
+#define TUNE_PROMPT_MS      5000                        // 5 s on first boot
+#define TUNE_PROMPT_MS_SAVED 1500                       // 1.5 s on subsequent boots
+
 #define SENSE_EASE_MS       15000UL   // loosen filters after quiet
 #define NF_DECAY_MS         60000UL   // drop NF after sustained quiet
 #define DIST_STALE_MS       300000UL  // dim the hero value after 5 min
 #define SENSOR_WDT_MS       600000UL  // re-init if no IRQ in 10 min
+
+#define NVS_NAMESPACE       "flashbee"
+#define NVS_KEY_TUNCAP      "tuncap"
+#define NVS_KEY_TUNHZ       "tunhz"
 
 // ── Sensor + UI state ──────────────────────────────────────────
 uint8_t  noiseFloor   = 2;
@@ -118,6 +145,11 @@ bool     sensorOk     = false;
 bool     noiseFault   = false;
 const bool outdoorMode = (AS3935_AFE_GB == AFE_GB_OUTDOOR);
 uint8_t  i2cFailStreak = 0;
+
+uint8_t  activeTunCap = AS3935_TUN_CAP;   // overridden from NVS at boot
+uint32_t activeLcoHz  = 0;                 // 0 = untuned / unknown
+
+Preferences prefs;
 
 // ── Ticker ──────────────────────────────────────────────────────
 #define MAX_TICKS 20
@@ -232,8 +264,8 @@ bool initAS3935() {
   if (!maskWrite(REG_AFE_GAIN, AFE_GB_FIELD_MASK | PWD_BIT, AS3935_AFE_GB))
     return false;
 
-  // 4. Antenna tune cap.
-  if (!maskWrite(REG_TUN_CAP, TUN_CAP_MASK, AS3935_TUN_CAP & TUN_CAP_MASK))
+  // 4. Antenna tune cap (from NVS if calibrated, else build-time default).
+  if (!maskWrite(REG_TUN_CAP, TUN_CAP_MASK, activeTunCap & TUN_CAP_MASK))
     return false;
 
   // 5. NF + WDTH.
@@ -422,6 +454,203 @@ void drawUI() {
   spr.pushSprite(0, 0);
 }
 
+// ── Antenna tune ───────────────────────────────────────────────
+volatile uint32_t lcoEdgeCount = 0;
+void IRAM_ATTR lcoISR() { lcoEdgeCount++; }
+
+// Route LCO to INT pin, set FDIV=128. Returns true on success.
+bool enableLcoOut() {
+  // REG_LCO_INT bits [7:6] = LCO_FDIV; 11b = /128.
+  if (!maskWrite(REG_LCO_INT, 0xC0, 0xC0)) return false;
+  // REG_TUN_CAP bit 7 = DISP_LCO.
+  if (!maskWrite(REG_TUN_CAP, 0x80, 0x80)) return false;
+  return true;
+}
+bool disableLcoOut() { return maskWrite(REG_TUN_CAP, 0x80, 0); }
+
+// Write TUN_CAP + count rising edges for windowMs. Returns Hz.
+uint32_t measureLcoHz(uint8_t cap, uint16_t windowMs) {
+  maskWrite(REG_TUN_CAP, TUN_CAP_MASK, cap & TUN_CAP_MASK);
+  delay(TUNE_SETTLE_MS);
+  noInterrupts(); lcoEdgeCount = 0; interrupts();
+  uint32_t t0 = millis();
+  while (millis() - t0 < windowMs) { delay(1); }
+  noInterrupts(); uint32_t n = lcoEdgeCount; interrupts();
+  return (uint32_t)((uint64_t)n * 1000UL / windowMs);
+}
+
+void drawTuneProgress(uint8_t cap, uint32_t hz, int32_t dev) {
+  spr.fillSprite(C_BG);
+  spr.drawCircle(CX, CY, 118, C_DIMRING);
+  spr.setTextDatum(TC_DATUM);
+  spr.setTextColor(C_GOLD, C_BG);
+  spr.setTextSize(2);
+  spr.drawString("ANTENNA TUNE", CX, 30);
+
+  spr.setTextDatum(MC_DATUM);
+  spr.setTextColor(C_GREY, C_BG);
+  spr.setTextSize(1);
+  char buf[24];
+  snprintf(buf, sizeof(buf), "TUN_CAP %2u / 15", cap);
+  spr.drawString(buf, CX, 80);
+
+  spr.setTextColor(abs(dev) <= (int32_t)LCO_TOL_HZ ? C_GREEN : C_ORANGE, C_BG);
+  spr.setTextSize(3);
+  snprintf(buf, sizeof(buf), "%lu", (unsigned long)hz);
+  spr.drawString(buf, CX, 110);
+  spr.setTextSize(1);
+  spr.setTextColor(C_GREY, C_BG);
+  spr.drawString("Hz", CX, 134);
+
+  snprintf(buf, sizeof(buf), "target %lu +-%lu",
+           (unsigned long)LCO_EXPECTED_HZ, (unsigned long)LCO_TOL_HZ);
+  spr.drawString(buf, CX, 150);
+
+  // Progress bar
+  int bx = 40, by = 180, bw = 160, bh = 14;
+  spr.drawRoundRect(bx - 2, by - 2, bw + 4, bh + 4, 3, C_DIM);
+  int filled = (int)((cap + 1) * bw / 16);
+  spr.fillRect(bx, by, filled, bh, C_GOLD);
+
+  spr.pushSprite(0, 0);
+}
+
+void drawTuneResult(bool ok, uint8_t cap, uint32_t hz) {
+  spr.fillSprite(C_BG);
+  spr.drawCircle(CX, CY, 118, C_DIMRING);
+  spr.setTextDatum(TC_DATUM);
+  spr.setTextColor(ok ? C_GREEN : C_RED, C_BG);
+  spr.setTextSize(2);
+  spr.drawString(ok ? "TUNED" : "OUT OF", CX, 26);
+  if (!ok) spr.drawString("RANGE", CX, 48);
+
+  spr.setTextDatum(MC_DATUM);
+  char buf[32];
+  spr.setTextColor(C_GOLD, C_BG);
+  spr.setTextSize(3);
+  snprintf(buf, sizeof(buf), "CAP=%u", cap);
+  spr.drawString(buf, CX, 100);
+
+  spr.setTextColor(C_GREY, C_BG);
+  spr.setTextSize(2);
+  snprintf(buf, sizeof(buf), "%lu Hz", (unsigned long)hz);
+  spr.drawString(buf, CX, 140);
+
+  spr.setTextSize(1);
+  spr.setTextColor(ok ? C_GREY : C_ORANGE, C_BG);
+  spr.drawString(ok ? "saved to NVS" : "not saved", CX, 170);
+  spr.drawString("rebooting...", CX, 190);
+  spr.pushSprite(0, 0);
+}
+
+void drawTuneError(const char* line1, const char* line2) {
+  spr.fillSprite(C_BG);
+  spr.drawCircle(CX, CY, 118, C_DIMRING);
+  spr.setTextDatum(MC_DATUM);
+  spr.setTextColor(C_RED, C_BG);
+  spr.setTextSize(2);
+  spr.drawString(line1, CX, CY - 20);
+  spr.setTextSize(1);
+  spr.setTextColor(C_GREY, C_BG);
+  spr.drawString(line2, CX, CY + 8);
+  spr.pushSprite(0, 0);
+}
+
+// Runs the full TUN_CAP sweep. Persists the best value to NVS if
+// at least one cap reads a plausible LCO frequency. Returns true
+// on success (tune completed, value saved).
+bool runAntennaTune() {
+  Serial.println(F("\n=== Antenna tune ==="));
+  Serial.print  (F("Target: ")); Serial.print(LCO_EXPECTED_HZ);
+  Serial.print  (F(" Hz +/- "));  Serial.print(LCO_TOL_HZ);
+  Serial.println(F(" Hz (500 kHz/128, +/-3.5%)"));
+
+  // Bring AS3935 to a known state for cal.
+  if (!writeReg(REG_PRESET_DEFAULT, DIRECT_CMD_VALUE)) {
+    drawTuneError("I2C FAIL", "no ACK from AS3935");
+    return false;
+  }
+  delay(3);
+  writeReg(REG_CALIB_RCO, DIRECT_CMD_VALUE);
+  delay(3);
+
+  if (!enableLcoOut()) {
+    drawTuneError("I2C FAIL", "enable DISP_LCO failed");
+    return false;
+  }
+
+  pinMode(AS3935_INT_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(AS3935_INT_PIN), lcoISR, RISING);
+
+  uint32_t freqs[16];
+  uint32_t maxHz = 0;
+  int32_t  bestAbsDev = INT32_MAX;
+  uint8_t  bestCap = 0;
+
+  for (uint8_t cap = 0; cap < 16; cap++) {
+    freqs[cap] = measureLcoHz(cap, TUNE_WINDOW_MS);
+    int32_t dev = (int32_t)freqs[cap] - (int32_t)LCO_EXPECTED_HZ;
+    Serial.printf("TUN_CAP=%2u -> %5lu Hz (%+5ld)\n",
+                  cap, (unsigned long)freqs[cap], (long)dev);
+    if (freqs[cap] > maxHz) maxHz = freqs[cap];
+    int32_t adev = dev < 0 ? -dev : dev;
+    if (adev < bestAbsDev) { bestAbsDev = adev; bestCap = cap; }
+    drawTuneProgress(cap, freqs[cap], dev);
+  }
+
+  detachInterrupt(digitalPinToInterrupt(AS3935_INT_PIN));
+  disableLcoOut();
+
+  // Sanity: if nothing looks like a real LCO, the INT wire is missing.
+  if (maxHz < 500) {
+    Serial.println(F("ERROR: no LCO edges detected on AS3935_INT_PIN."));
+    Serial.println(F("       Check the INT jumper from the AS3935 module"));
+    Serial.print  (F("       to XIAO GPIO ")); Serial.println(AS3935_INT_PIN);
+    drawTuneError("NO SIGNAL", "check INT wire");
+    delay(4000);
+    return false;
+  }
+
+  bool inTol = (bestAbsDev <= (int32_t)LCO_TOL_HZ);
+  Serial.printf("best: TUN_CAP=%u @ %lu Hz (dev %+ld, %s)\n",
+                bestCap, (unsigned long)freqs[bestCap],
+                (long)((int32_t)freqs[bestCap] - (int32_t)LCO_EXPECTED_HZ),
+                inTol ? "WITHIN TOL" : "OUT OF TOL");
+
+  prefs.begin(NVS_NAMESPACE, false);
+  prefs.putUChar(NVS_KEY_TUNCAP, bestCap);
+  prefs.putUInt (NVS_KEY_TUNHZ, freqs[bestCap]);
+  prefs.end();
+
+  activeTunCap = bestCap;
+  activeLcoHz  = freqs[bestCap];
+
+  drawTuneResult(inTol, bestCap, freqs[bestCap]);
+  delay(3500);
+  return inTol;
+}
+
+// Poll serial for a "tune" line within windowMs. Non-blocking-ish.
+bool pollForTuneCmd(uint32_t windowMs) {
+  String buf;
+  uint32_t start = millis();
+  while (millis() - start < windowMs) {
+    while (Serial.available()) {
+      char c = Serial.read();
+      if (c == '\r' || c == '\n') {
+        buf.trim();
+        if (buf.equalsIgnoreCase("tune")) return true;
+        buf = "";
+      } else {
+        buf += c;
+        if (buf.length() > 16) buf = "";
+      }
+    }
+    delay(5);
+  }
+  return false;
+}
+
 // ── Setup ──────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
@@ -433,12 +662,36 @@ void setup() {
   spr.setTextFont(1);
   memset(tickEnergy, 0, sizeof(tickEnergy));
 
-  drawBoot("AS3935", "initializing...", C_GREY);
-
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   Wire.setClock(I2C_HZ);
   Wire.setTimeOut(I2C_TIMEOUT_MS);
 
+  // Load saved antenna calibration, if any.
+  prefs.begin(NVS_NAMESPACE, true);
+  bool haveSavedTune = prefs.isKey(NVS_KEY_TUNCAP);
+  if (haveSavedTune) {
+    activeTunCap = prefs.getUChar(NVS_KEY_TUNCAP, AS3935_TUN_CAP);
+    activeLcoHz  = prefs.getUInt (NVS_KEY_TUNHZ, 0);
+  }
+  prefs.end();
+
+  // Prompt for antenna tune over serial. Longer window on first boot
+  // (no saved calibration) because the user should really do this.
+  if (haveSavedTune) {
+    Serial.printf("[tune] using saved TUN_CAP=%u (LCO %lu Hz)\n",
+                  activeTunCap, (unsigned long)activeLcoHz);
+    drawBoot("AS3935", "send 'tune' to recal", C_GREY);
+  } else {
+    Serial.println(F("[tune] no saved antenna calibration."));
+    Serial.println(F("[tune] send 'tune' on serial to calibrate now."));
+    drawBoot("AS3935", "send 'tune' to calibr", C_ORANGE);
+  }
+
+  if (pollForTuneCmd(haveSavedTune ? TUNE_PROMPT_MS_SAVED : TUNE_PROMPT_MS)) {
+    runAntennaTune();
+  }
+
+  drawBoot("AS3935", "initializing...", C_GREY);
   sensorOk = initAS3935();
   if (sensorOk) {
     drawBoot("AS3935", outdoorMode ? "outdoor mode" : "indoor mode", C_GREEN);
