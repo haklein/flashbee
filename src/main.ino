@@ -89,8 +89,9 @@ TFT_eSprite spr = TFT_eSprite(&tft);
   #define AS3935_TUN_CAP    0
 #endif
 
-#define I2C_SDA_PIN         6
-#define I2C_SCL_PIN         7
+// I²C uses the XIAO variant's default SDA/SCL pins (D4/D5 on the
+// silkscreen); the underlying GPIO numbers differ between C3 and C6
+// but `Wire.begin(SDA, SCL)` resolves correctly on either.
 #define I2C_HZ              100000
 #define I2C_TIMEOUT_MS      50
 #define I2C_FAIL_LIMIT      8
@@ -99,9 +100,9 @@ TFT_eSprite spr = TFT_eSprite(&tft);
 // fly-lead from the AS3935 module's INT pad to a free XIAO pin.
 // Instructables build already asks you to remove the Grove connector
 // and solder direct wires — add one more for INT.
-// Default: D2 on XIAO ESP32-C3 = GPIO4 (not used by the display).
+// Default: D2 on the XIAO silkscreen (GPIO4 on C3, GPIO2 on C6).
 #ifndef AS3935_INT_PIN
-  #define AS3935_INT_PIN    4
+  #define AS3935_INT_PIN    D2
 #endif
 
 // Antenna-tune params (datasheet §8.11, app-note AN-LDS1.1)
@@ -605,7 +606,9 @@ bool runAntennaTune() {
   if (maxHz < 500) {
     Serial.println(F("ERROR: no LCO edges detected on AS3935_INT_PIN."));
     Serial.println(F("       Check the INT jumper from the AS3935 module"));
-    Serial.print  (F("       to XIAO GPIO ")); Serial.println(AS3935_INT_PIN);
+    Serial.print  (F("       to XIAO GPIO (arduino pin #"));
+    Serial.print  (AS3935_INT_PIN);
+    Serial.println(F(")"));
     drawTuneError("NO SIGNAL", "check INT wire");
     delay(4000);
     return false;
@@ -662,7 +665,7 @@ void setup() {
   spr.setTextFont(1);
   memset(tickEnergy, 0, sizeof(tickEnergy));
 
-  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.begin(SDA, SCL);
   Wire.setClock(I2C_HZ);
   Wire.setTimeOut(I2C_TIMEOUT_MS);
 
