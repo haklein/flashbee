@@ -1,152 +1,275 @@
+// Flash Bee — handheld AS3935 lightning detector.
+// Reworked against the AS3935 datasheet rev 1.07 §8.10–§8.11.
+// NOT a life-safety device. Always follow the NWS 30/30 rule.
+
 #include <Wire.h>
 #include <SPI.h>
 #include <TFT_eSPI.h>
 #include <math.h>
 
-// ── Display ───────────────────────────────────────────────────
-TFT_eSPI     tft = TFT_eSPI();
-TFT_eSprite  spr = TFT_eSprite(&tft);
-
+// ── Display ─────────────────────────────────────────────────────
+TFT_eSPI    tft = TFT_eSPI();
+TFT_eSprite spr = TFT_eSprite(&tft);
 #define CX  120
 #define CY  120
 
-// ── Colors ────────────────────────────────────────────────────
+// ── Colors ──────────────────────────────────────────────────────
 #define C_BG      0x0000
 #define C_GOLD    0xFEA0
 #define C_ORANGE  0xFBE0
 #define C_REDORG  0xF9A0
+#define C_RED     0xF800
 #define C_DIM     0x2104
 #define C_DIMRING 0x10A2
 #define C_GREEN   0x07E0
 #define C_WHITE   0xFFFF
 #define C_GREY    0x4208
 
-// ── AS3935 ────────────────────────────────────────────────────
-#define AS3935_ADDR 3
-#define SENSE_INCREASE_INTERVAL 15000UL
+// ── AS3935 register map (datasheet §8.10) ──────────────────────
+#define AS3935_I2C_ADDR       0x03
 
+#define REG_AFE_GAIN          0x00
+  #define AFE_GB_FIELD_SHIFT  1
+  #define AFE_GB_FIELD_MASK   (0x1F << AFE_GB_FIELD_SHIFT)
+  // Datasheet values for the 5-bit AFE_GB field, placed into bits [5:1]:
+  #define AFE_GB_INDOOR       (0b10010 << AFE_GB_FIELD_SHIFT)  // 0x24
+  #define AFE_GB_OUTDOOR      (0b01110 << AFE_GB_FIELD_SHIFT)  // 0x1C
+  #define PWD_BIT             0x01
+
+#define REG_NF_WDG            0x01
+  #define NF_MASK             (0x07 << 4)
+  #define WDTH_MASK           0x0F
+
+#define REG_CLSTAT_SREJ       0x02
+  #define CL_STAT_EN_BIT      (1 << 7)
+  #define CL_STAT_BIT         (1 << 6)
+  #define MIN_NUM_LIGH_MASK   (0x03 << 4)
+  #define SREJ_MASK           0x0F
+
+#define REG_LCO_INT           0x03
+  #define MASK_DIST_BIT       (1 << 5)
+  #define INT_MASK            0x0F
+  #define INT_NH              0x01
+  #define INT_D               0x04
+  #define INT_L               0x08
+
+#define REG_ENERGY_LSB        0x04
+#define REG_ENERGY_MID        0x05
+#define REG_ENERGY_MSB        0x06
+
+#define REG_DISTANCE          0x07
+  #define DIST_FIELD_MASK     0x3F
+  #define DIST_OUT_OF_RANGE   0x3F
+  #define DIST_OVERHEAD       0x01
+  #define DIST_UNKNOWN        0x00
+
+#define REG_TUN_CAP           0x08
+  #define TUN_CAP_MASK        0x0F
+  #define DISP_TRCO_BIT       (1 << 5)
+
+#define REG_TRCO_CAL          0x3A
+#define REG_SRCO_CAL          0x3B
+  #define CALIB_DONE_BIT      (1 << 7)
+  #define CALIB_NOK_BIT       (1 << 6)
+
+#define REG_PRESET_DEFAULT    0x3C
+#define REG_CALIB_RCO         0x3D
+#define DIRECT_CMD_VALUE      0x96
+
+// ── Tunables ────────────────────────────────────────────────────
+// Handheld → outdoor by default. Override with build_flags:
+//   -DAS3935_AFE_GB=AFE_GB_INDOOR
+#ifndef AS3935_AFE_GB
+  #define AS3935_AFE_GB     AFE_GB_OUTDOOR
+#endif
+// Antenna LC tank tune (0..15). Factory-tuned per board; verify by
+// watching the LCO on IRQ (reg 0x08 bit 7). Leave 0 until tuned.
+#ifndef AS3935_TUN_CAP
+  #define AS3935_TUN_CAP    0
+#endif
+
+#define I2C_SDA_PIN         6
+#define I2C_SCL_PIN         7
+#define I2C_HZ              100000
+#define I2C_TIMEOUT_MS      50
+#define I2C_FAIL_LIMIT      8
+
+#define SENSE_EASE_MS       15000UL   // loosen filters after quiet
+#define NF_DECAY_MS         60000UL   // drop NF after sustained quiet
+#define DIST_STALE_MS       300000UL  // dim the hero value after 5 min
+#define SENSOR_WDT_MS       600000UL  // re-init if no IRQ in 10 min
+
+// ── Sensor + UI state ──────────────────────────────────────────
 uint8_t  noiseFloor   = 2;
-uint8_t  watchdog     = 2;
+uint8_t  watchdogLvl  = 2;
 uint8_t  spikeRej     = 2;
 uint32_t senseLastAdj = 0;
+uint32_t nfLastDecay  = 0;
+uint32_t lastIrqMs    = 0;
 
 int      strikeCount  = 0;
 uint32_t maxEnergy    = 0;
 uint32_t lastEnergy   = 0;
-uint8_t  lastDist     = 0;
+uint8_t  lastDistRaw  = DIST_UNKNOWN;
+uint32_t lastStrikeMs = 0;
 float    radarAngle   = 0;
 
-// ── Ticker ────────────────────────────────────────────────────
+bool     sensorOk     = false;
+bool     noiseFault   = false;
+const bool outdoorMode = (AS3935_AFE_GB == AFE_GB_OUTDOOR);
+uint8_t  i2cFailStreak = 0;
+
+// ── Ticker ──────────────────────────────────────────────────────
 #define MAX_TICKS 20
 uint32_t tickEnergy[MAX_TICKS];
 int      tickHead  = 0;
 int      tickCount = 0;
 
-// ── AS3935 helpers ────────────────────────────────────────────
-uint8_t readReg(uint8_t reg) {
-  Wire.beginTransmission(AS3935_ADDR);
+// ── I²C with error tracking ────────────────────────────────────
+bool i2cRead(uint8_t reg, uint8_t &out) {
+  Wire.beginTransmission(AS3935_I2C_ADDR);
   Wire.write(reg);
-  Wire.endTransmission(false);
-  Wire.requestFrom(AS3935_ADDR, 1);
-  return Wire.available() ? Wire.read() : 0xFF;
+  if (Wire.endTransmission(false) != 0) { i2cFailStreak++; return false; }
+  if (Wire.requestFrom((uint8_t)AS3935_I2C_ADDR, (uint8_t)1) != 1) {
+    i2cFailStreak++; return false;
+  }
+  if (!Wire.available()) { i2cFailStreak++; return false; }
+  out = Wire.read();
+  i2cFailStreak = 0;
+  return true;
 }
 
-void writeReg(uint8_t reg, uint8_t val) {
-  Wire.beginTransmission(AS3935_ADDR);
+uint8_t readReg(uint8_t reg) { uint8_t v = 0xFF; i2cRead(reg, v); return v; }
+
+bool writeReg(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(AS3935_I2C_ADDR);
   Wire.write(reg);
   Wire.write(val);
-  Wire.endTransmission(true);
+  if (Wire.endTransmission(true) != 0) { i2cFailStreak++; return false; }
+  i2cFailStreak = 0;
+  return true;
 }
 
-void maskWrite(uint8_t reg, uint8_t mask, uint8_t val) {
-  writeReg(reg, (readReg(reg) & ~mask) | (val & mask));
+bool maskWrite(uint8_t reg, uint8_t mask, uint8_t val) {
+  uint8_t cur;
+  if (!i2cRead(reg, cur)) return false;
+  return writeReg(reg, (cur & ~mask) | (val & mask));
 }
 
+// ── Energy + ticker ─────────────────────────────────────────────
 uint32_t readEnergy() {
-  return ((uint32_t)(readReg(0x06) & 0x1F) << 16)
-       | ((uint32_t) readReg(0x05)          <<  8)
-       |             readReg(0x04);
+  return ((uint32_t)(readReg(REG_ENERGY_MSB) & 0x1F) << 16)
+       | ((uint32_t) readReg(REG_ENERGY_MID)         <<  8)
+       |             readReg(REG_ENERGY_LSB);
 }
-
 void pushTick(uint32_t e) {
   tickEnergy[tickHead] = e;
   tickHead = (tickHead + 1) % MAX_TICKS;
   if (tickCount < MAX_TICKS) tickCount++;
 }
 
+// ── Filter adjustments ─────────────────────────────────────────
+// Datasheet §8.4: higher WDTH/SREJ = more disturber rejection =
+// LOWER detection efficiency. The names below reflect that trade.
 void applyWatchdogSpike() {
-  writeReg(0x01, (noiseFloor << 4) | (watchdog & 0x0F));
-  maskWrite(0x02, 0x0F, spikeRej & 0x0F);
+  maskWrite(REG_NF_WDG, WDTH_MASK, watchdogLvl & WDTH_MASK);
+  maskWrite(REG_CLSTAT_SREJ, SREJ_MASK, spikeRej & SREJ_MASK);
 }
-
-void increaseSensitivity() {
-  if (spikeRej < watchdog) {
-    if (spikeRej < 11) { spikeRej++; Serial.print("[TUNE] Spike up: "); Serial.println(spikeRej); }
-  } else {
-    if (watchdog  < 10) { watchdog++;  Serial.print("[TUNE] WD up: ");   Serial.println(watchdog);  }
-  }
+void tightenFilters() {
+  if (spikeRej < watchdogLvl) { if (spikeRej < 11) spikeRej++; }
+  else                        { if (watchdogLvl < 10) watchdogLvl++; }
   applyWatchdogSpike();
 }
-
-void decreaseSensitivity() {
-  if (spikeRej > watchdog) {
-    if (spikeRej > 0) { spikeRej--; Serial.print("[TUNE] Spike dn: "); Serial.println(spikeRej); }
-  } else {
-    if (watchdog  > 0) { watchdog--;  Serial.print("[TUNE] WD dn: ");   Serial.println(watchdog);  }
-  }
+void loosenFilters() {
+  if (spikeRej > watchdogLvl) { if (spikeRej > 0) spikeRej--; }
+  else                        { if (watchdogLvl > 0) watchdogLvl--; }
   applyWatchdogSpike();
 }
-
 void raiseNoiseFloor() {
   if (noiseFloor < 7) {
     noiseFloor++;
-    maskWrite(0x01, 0x70, noiseFloor << 4);
-    Serial.print("[NF] Raised to "); Serial.println(noiseFloor);
+    maskWrite(REG_NF_WDG, NF_MASK, (noiseFloor << 4) & NF_MASK);
+    noiseFault = false;
+  } else {
+    // At the hardware limit: environment is too noisy for the AS3935
+    // to operate per datasheet. Surface this instead of hiding it.
+    noiseFault = true;
   }
 }
+void lowerNoiseFloor() {
+  if (noiseFloor > 0) {
+    noiseFloor--;
+    maskWrite(REG_NF_WDG, NF_MASK, (noiseFloor << 4) & NF_MASK);
+  }
+  noiseFault = false;
+}
 
-// ── Intensity color ───────────────────────────────────────────
+// ── Init sequence (datasheet §8.11) ────────────────────────────
+bool initAS3935() {
+  // 1. PRESET_DEFAULT: restore register defaults.
+  if (!writeReg(REG_PRESET_DEFAULT, DIRECT_CMD_VALUE)) return false;
+  delay(3);
+
+  // 2. CALIB_RCO: calibrate the internal RCO timebase. Result lives
+  // in volatile memory, so it must be re-run after every POR.
+  if (!writeReg(REG_CALIB_RCO, DIRECT_CMD_VALUE)) return false;
+  maskWrite(REG_TUN_CAP, DISP_TRCO_BIT, DISP_TRCO_BIT);
+  delay(3);
+  maskWrite(REG_TUN_CAP, DISP_TRCO_BIT, 0);
+
+  uint8_t trco = readReg(REG_TRCO_CAL);
+  uint8_t srco = readReg(REG_SRCO_CAL);
+  if (!(trco & CALIB_DONE_BIT) || (trco & CALIB_NOK_BIT)) {
+    Serial.print("[CAL] TRCO fail: 0x"); Serial.println(trco, HEX);
+    return false;
+  }
+  if (!(srco & CALIB_DONE_BIT) || (srco & CALIB_NOK_BIT)) {
+    Serial.print("[CAL] SRCO fail: 0x"); Serial.println(srco, HEX);
+    return false;
+  }
+
+  // 3. AFE gain + PWD=0.
+  if (!maskWrite(REG_AFE_GAIN, AFE_GB_FIELD_MASK | PWD_BIT, AS3935_AFE_GB))
+    return false;
+
+  // 4. Antenna tune cap.
+  if (!maskWrite(REG_TUN_CAP, TUN_CAP_MASK, AS3935_TUN_CAP & TUN_CAP_MASK))
+    return false;
+
+  // 5. NF + WDTH.
+  noiseFloor = 2; watchdogLvl = 2; spikeRej = 2;
+  if (!writeReg(REG_NF_WDG, (noiseFloor << 4) | (watchdogLvl & WDTH_MASK)))
+    return false;
+
+  // 6. MIN_NUM_LIGH = 0 (single strike), SREJ, preserving CL_STAT_EN /
+  // CL_STAT in bits [7:6].
+  if (!maskWrite(REG_CLSTAT_SREJ,
+                 MIN_NUM_LIGH_MASK | SREJ_MASK,
+                 (0 << 4) | (spikeRej & SREJ_MASK))) return false;
+
+  // 7. Unmask disturbers so the tuner can see them.
+  if (!maskWrite(REG_LCO_INT, MASK_DIST_BIT, 0)) return false;
+
+  return true;
+}
+
+// ── UI helpers ─────────────────────────────────────────────────
 uint16_t energyColor(uint32_t e) {
   if      (e > 500000) return C_WHITE;
-  else if (e > 300000) return C_GOLD;
   else if (e > 150000) return C_GOLD;
   else if (e > 75000)  return C_ORANGE;
   else if (e > 20000)  return C_REDORG;
   else                 return C_DIM;
 }
-
-// ── Arc angle mapping ─────────────────────────────────────────
-// TFT_eSPI drawArc: 0° = 6 o'clock, clockwise
-// Our gauge: starts bottom-left (225°) sweeps clockwise to bottom-right (135°)
-// In TFT_eSPI coords: start=225, end=135 going through 0
-// We map pct 0.0-1.0 → start_angle=225 to end_angle=135 (270° sweep)
-// Arc background: full 225→135 sweep
-// Arc fill:       225 → 225 + pct*270
-
 void drawGaugeArc(TFT_eSprite &s, uint16_t fillColor, float pct) {
-  uint8_t r_outer = 116;
-  uint8_t r_inner = 106;   // thickness = 10px
-
-  // Background arc — full sweep
-  // drawArc is on tft, not sprite — we need to draw on sprite
-  // Use sprite's drawArc if available, else pixel method
-  // TFT_eSprite inherits drawArc from TFT_eSPI so it works on sprite too
-
-  // Background: 225 → 135 (full 270°)
-  s.drawArc(CX, CY, r_outer, r_inner, 225, 135, 0x1082, C_BG, false);
-
-  // Filled portion
+  s.drawArc(CX, CY, 116, 106, 225, 135, 0x1082, C_BG, false);
   if (pct > 0.01f) {
     uint16_t endAngle = (uint16_t)(225 + pct * 270) % 360;
-    s.drawArc(CX, CY, r_outer, r_inner, 225, endAngle, fillColor, C_BG, true);
+    s.drawArc(CX, CY, 116, 106, 225, endAngle, fillColor, C_BG, true);
   }
 }
-
-// ── Tick marks on gauge ───────────────────────────────────────
 void drawGaugeTicks(TFT_eSprite &s, int count) {
   for (int i = 0; i <= count; i++) {
-    // map tick i onto 225°→135° sweep in screen coords
-    // TFT_eSPI 0°=6 o'clock, our 225° = bottom-left
     float deg = 225 + (270.0f / count) * i;
     float rad = deg * DEG_TO_RAD;
     int x1 = CX + (int)(104 * cos(rad));
@@ -156,52 +279,51 @@ void drawGaugeTicks(TFT_eSprite &s, int count) {
     s.drawLine(x1, y1, x2, y2, 0x2945);
   }
 }
-
-// ── Flash on real lightning ───────────────────────────────────
 void flashScreen() {
   for (int i = 0; i < 2; i++) {
-    spr.fillSprite(0x2945);
-    spr.pushSprite(0, 0);
-    delay(35);
-    spr.fillSprite(C_BG);
-    spr.pushSprite(0, 0);
-    delay(20);
+    spr.fillSprite(0x2945); spr.pushSprite(0, 0); delay(35);
+    spr.fillSprite(C_BG);   spr.pushSprite(0, 0); delay(20);
   }
 }
-
-// ── Boot screen ───────────────────────────────────────────────
-void drawBoot(const char* msg, uint16_t color) {
+void drawBoot(const char* line1, const char* line2, uint16_t color) {
   tft.fillScreen(C_BG);
   tft.drawCircle(CX, CY, 118, C_DIMRING);
   tft.setTextDatum(MC_DATUM);
   tft.setTextColor(C_GOLD, C_BG);
   tft.setTextSize(2);
-  tft.drawString("AS3935", CX, CY - 14);
+  tft.drawString(line1, CX, CY - 14);
   tft.setTextSize(1);
   tft.setTextColor(color, C_BG);
-  tft.drawString(msg, CX, CY + 12);
+  tft.drawString(line2, CX, CY + 12);
+}
+void drawSensorLost() {
+  spr.fillSprite(C_BG);
+  spr.drawCircle(CX, CY, 118, C_DIMRING);
+  spr.setTextDatum(MC_DATUM);
+  spr.setTextColor(C_RED, C_BG);
+  spr.setTextSize(2);
+  spr.drawString("SENSOR", CX, CY - 18);
+  spr.drawString("LOST",   CX, CY + 4);
+  spr.setTextSize(1);
+  spr.setTextColor(C_GREY, C_BG);
+  spr.drawString("I2C fault - retrying", CX, CY + 32);
+  spr.pushSprite(0, 0);
 }
 
-// ── Main UI ───────────────────────────────────────────────────
+// ── Main UI ────────────────────────────────────────────────────
 void drawUI() {
+  if (!sensorOk) { drawSensorLost(); return; }
+
   spr.fillSprite(C_BG);
-
-  float pct = (lastEnergy > 0)
-              ? constrain(lastEnergy / 2097151.0f, 0, 1)
-              : 0;
-
-  // ── Energy gauge arc ──────────────────────────────────────
+  float pct = (lastEnergy > 0) ? constrain(lastEnergy / 2097151.0f, 0.f, 1.f) : 0;
   drawGaugeArc(spr, energyColor(lastEnergy), pct);
   drawGaugeTicks(spr, 10);
-
-  // ── Outer border circle ───────────────────────────────────
   spr.drawCircle(CX, CY, 119, 0x2124);
+  spr.drawCircle(CX, CY, 90,  C_DIM);
+  spr.drawCircle(CX, CY, 58,  C_DIM);
 
-  // ── Inner guide rings ─────────────────────────────────────
-  spr.drawCircle(CX, CY, 90, C_DIM);
-  spr.drawCircle(CX, CY, 58, C_DIM);
-
-  // ── Radar sweep ───────────────────────────────────────────
+  // Decorative radar sweep — AS3935 is non-directional. Position
+  // of the sweep does NOT indicate strike bearing.
   float rad = radarAngle * DEG_TO_RAD;
   for (int len = 20; len <= 86; len += 4) {
     float    tr = (radarAngle - (86 - len) * 0.4f) * DEG_TO_RAD;
@@ -214,207 +336,201 @@ void drawUI() {
                CX + (int)(86 * cos(rad)),
                CY + (int)(86 * sin(rad)), 0x05C0);
 
-  // ── TOP LABEL ─────────────────────────────────────────────
   spr.setTextDatum(TC_DATUM);
   spr.setTextColor(C_GREY, C_BG);
   spr.setTextSize(1);
   spr.drawString("LIGHTNING DETECTOR", CX, 16);
 
-  // ── WD / SR tune indicator ────────────────────────────────
-  String tuneStr = "WD:" + String(watchdog) + " SR:" + String(spikeRej);
-  spr.setTextColor(C_DIM, C_BG);
-  spr.setTextSize(1);
-  spr.setTextDatum(TC_DATUM);
-  spr.drawString(tuneStr, CX, 27);
+  if (noiseFault) {
+    spr.setTextColor(C_RED, C_BG);
+    spr.drawString("ENV TOO NOISY", CX, 27);
+  } else {
+    String tuneStr = (outdoorMode ? "OUT " : "IN  ");
+    tuneStr += "WD:" + String(watchdogLvl) + " SR:" + String(spikeRej);
+    bool tight = (watchdogLvl > 5 || spikeRej > 5);
+    spr.setTextColor(tight ? C_ORANGE : C_DIM, C_BG);
+    spr.drawString(tuneStr, CX, 27);
+  }
 
-  // ── DISTANCE — hero value (YELLOW, BIG) ───────────────────
+  // Hero distance.
   spr.setTextDatum(MC_DATUM);
+  bool stale = strikeCount > 0 && (millis() - lastStrikeMs) > DIST_STALE_MS;
+  uint16_t heroColor = stale ? C_DIM : C_GOLD;
 
   if (strikeCount == 0) {
     spr.setTextColor(C_DIM, C_BG);
-    spr.setTextSize(3);
-    spr.drawString("--", CX, 84);
-    spr.setTextSize(1);
-    spr.setTextColor(C_GREY, C_BG);
-    spr.drawString("waiting...", CX, 108);
-
-  } else if (lastDist == 0x3F) {
-    // out of range
-    spr.setTextColor(C_GOLD, C_BG);
-    spr.setTextSize(3);
-    spr.drawString(">40", CX, 80);
-    spr.setTextSize(2);
-    spr.setTextColor(C_GOLD, C_BG);
-    spr.drawString("km", CX, 105);
-
-  } else if (lastDist == 0x01) {
-    // overhead
+    spr.setTextSize(3); spr.drawString("--", CX, 84);
+    spr.setTextSize(1); spr.setTextColor(C_GREY, C_BG);
+    spr.drawString("listening...", CX, 108);
+  } else if (lastDistRaw == DIST_UNKNOWN) {
+    spr.setTextColor(C_DIM, C_BG);
+    spr.setTextSize(3); spr.drawString("--", CX, 84);
+    spr.setTextSize(1); spr.setTextColor(C_GREY, C_BG);
+    spr.drawString("distance unknown", CX, 108);
+  } else if (lastDistRaw == DIST_OUT_OF_RANGE) {
+    spr.setTextColor(heroColor, C_BG);
+    spr.setTextSize(3); spr.drawString(">40", CX, 80);
+    spr.setTextSize(2); spr.drawString("km", CX, 105);
+  } else if (lastDistRaw == DIST_OVERHEAD) {
     spr.setTextColor(C_REDORG, C_BG);
-    spr.setTextSize(2);
-    spr.drawString("OVERHEAD", CX, 78);
-    spr.setTextSize(2);
-    spr.setTextColor(C_GOLD, C_BG);
-    spr.drawString("< 1 km", CX, 100);
-
+    spr.setTextSize(2); spr.drawString("OVERHEAD", CX, 78);
+    spr.setTextColor(heroColor, C_BG);
+    spr.drawString("< 6 km", CX, 100);
   } else {
-    // normal distance — SIZE 6 yellow number + SIZE 3 km
-    spr.setTextColor(C_GOLD, C_BG);
-    spr.setTextSize(6);
-    spr.drawString(String(lastDist), CX, 80);
-    spr.setTextColor(C_GOLD, C_BG);
-    spr.setTextSize(3);
-    spr.drawString("km", CX, 112);
+    spr.setTextColor(heroColor, C_BG);
+    spr.setTextSize(6); spr.drawString(String(lastDistRaw), CX, 80);
+    spr.setTextSize(3); spr.drawString("km", CX, 112);
   }
 
-  // ── DIVIDER ───────────────────────────────────────────────
   spr.drawFastHLine(44, 128, 152, C_DIM);
 
-  // ── STRIKES (left) ────────────────────────────────────────
   spr.setTextDatum(ML_DATUM);
   spr.setTextColor(C_GREY, C_BG);
   spr.setTextSize(1);
   spr.drawString("STRIKES", 40, 140);
-  spr.setTextColor(C_GOLD, C_BG);
+  spr.setTextColor(heroColor, C_BG);
   spr.setTextSize(2);
   spr.drawString(String(strikeCount), 40, 156);
 
-  // ── ENERGY (right) ────────────────────────────────────────
   spr.setTextDatum(MR_DATUM);
   spr.setTextColor(C_GREY, C_BG);
   spr.setTextSize(1);
   spr.drawString("ENERGY", 200, 140);
   spr.setTextColor(energyColor(lastEnergy), C_BG);
   spr.setTextSize(2);
-  String eStr = lastEnergy > 999
-                ? String(lastEnergy / 1000) + "K"
-                : String(lastEnergy);
+  String eStr = lastEnergy > 999 ? String(lastEnergy / 1000) + "K"
+                                 : String(lastEnergy);
   spr.drawString(eStr, 200, 156);
 
-  // ── TICKER BAR ────────────────────────────────────────────
   int bax = 32, bay = 176, baw = 176, bah = 30;
   int bw  = baw / MAX_TICKS - 1;
-
   spr.drawRoundRect(bax - 2, bay - 2, baw + 4, bah + 6, 4, C_DIM);
-
   for (int i = 0; i < tickCount; i++) {
-    int      idx  = (tickHead - tickCount + i + MAX_TICKS) % MAX_TICKS;
-    float    bpct = constrain(tickEnergy[idx] / 2097151.0f, 0, 1);
-    int      bh   = max(2, (int)(bpct * bah));
-    int      bx   = bax + i * (bw + 1);
-    int      by   = bay + bah - bh;
-    uint16_t bc   = (i == tickCount - 1)
-                    ? C_GOLD
-                    : energyColor(tickEnergy[idx]);
+    int idx = (tickHead - tickCount + i + MAX_TICKS) % MAX_TICKS;
+    float bpct = constrain(tickEnergy[idx] / 2097151.0f, 0.f, 1.f);
+    int bh = max(2, (int)(bpct * bah));
+    int bx = bax + i * (bw + 1);
+    int by = bay + bah - bh;
+    uint16_t bc = (i == tickCount - 1) ? C_GOLD : energyColor(tickEnergy[idx]);
     spr.fillRect(bx, by, bw, bh, bc);
   }
-
   spr.setTextDatum(TC_DATUM);
   spr.setTextColor(C_GREY, C_BG);
   spr.setTextSize(1);
-  spr.drawString("ENERGY HISTORY", CX, 212);
+  spr.drawString(stale ? "HISTORY (stale)" : "ENERGY HISTORY", CX, 212);
 
   spr.pushSprite(0, 0);
 }
 
-// ── Setup ─────────────────────────────────────────────────────
+// ── Setup ──────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
 
   tft.init();
   tft.setRotation(0);
   tft.fillScreen(C_BG);
-
   spr.createSprite(240, 240);
   spr.setTextFont(1);
   memset(tickEnergy, 0, sizeof(tickEnergy));
 
-  drawBoot("INITIALIZING...", C_GREY);
+  drawBoot("AS3935", "initializing...", C_GREY);
 
-  Wire.begin(6, 7);
-  Wire.setClock(100000);
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(I2C_HZ);
+  Wire.setTimeOut(I2C_TIMEOUT_MS);
 
-  writeReg(0x00, 0b00010010);   // indoor AFE
-  delay(200);
-
-  Wire.beginTransmission(AS3935_ADDR);
-  Wire.write(0x3A);
-  Wire.endTransmission(false);
-  delay(200);
-
-  Wire.beginTransmission(AS3935_ADDR);
-  Wire.write(0x3B);
-  Wire.endTransmission(false);
-  delay(200);
-
-  Wire.requestFrom(AS3935_ADDR, 1);
-  if (Wire.available()) {
-    drawBoot("FOUND!", C_GREEN);
-    Serial.println("[AS3935] Found!");
-    delay(1200);
+  sensorOk = initAS3935();
+  if (sensorOk) {
+    drawBoot("AS3935", outdoorMode ? "outdoor mode" : "indoor mode", C_GREEN);
+    Serial.print("[AS3935] ready — "); Serial.println(outdoorMode ? "OUTDOOR" : "INDOOR");
+    delay(800);
   } else {
-    drawBoot("NOT FOUND", 0xF800);
-    Serial.println("[AS3935] Not found");
-    while (true) delay(1000);
+    drawBoot("AS3935", "INIT FAILED", C_RED);
+    Serial.println("[AS3935] init failed — will retry in loop");
+    delay(1500);
   }
 
-  noiseFloor = 2;
-  watchdog   = 2;
-  spikeRej   = 2;
+  uint32_t now = millis();
+  senseLastAdj = now;
+  nfLastDecay  = now;
+  lastIrqMs    = now;
 
-  writeReg(0x01, (noiseFloor << 4) | watchdog);
-  writeReg(0x02, spikeRej);
-  writeReg(0x03, 0x00);   // disturbers unmasked for auto-tune
-
-  senseLastAdj = millis();
-
-  Serial.println("[AS3935] Ready — polling, auto-tune active");
   drawUI();
 }
 
-// ── Loop ──────────────────────────────────────────────────────
+// ── Loop ───────────────────────────────────────────────────────
 void loop() {
-  uint8_t intReg = readReg(0x03);
-  uint8_t reason = intReg & 0x0F;
+  uint32_t now = millis();
 
-  if (reason == 0x01) {
-    Serial.println("[NH] Noise floor too high");
+  if (!sensorOk) {
+    static uint32_t nextRetry = 0;
+    if ((int32_t)(now - nextRetry) >= 0) {
+      sensorOk = initAS3935();
+      nextRetry = now + 3000;
+      if (sensorOk) {
+        Serial.println("[AS3935] recovered");
+        lastIrqMs = now;
+      }
+    }
+    radarAngle += 2.5f;
+    if (radarAngle >= 360) radarAngle -= 360;
+    drawUI();
+    delay(80);
+    return;
+  }
+
+  uint8_t intReg;
+  if (!i2cRead(REG_LCO_INT, intReg)) {
+    if (i2cFailStreak >= I2C_FAIL_LIMIT) {
+      Serial.println("[I2C] sensor lost");
+      sensorOk = false;
+    }
+    delay(50);
+    return;
+  }
+
+  uint8_t reason = intReg & INT_MASK;
+  if (reason != 0) lastIrqMs = now;
+
+  if (reason == INT_NH) {
+    Serial.println("[NH] noise floor too high");
     raiseNoiseFloor();
-    senseLastAdj = millis();
-
-  } else if (reason == 0x04) {
-    Serial.println("[D] Disturber — tuning up");
-    increaseSensitivity();
-    senseLastAdj = millis();
-    // silent — no flash, no screen update
-
-  } else if (reason == 0x08) {
-    delay(5);
+    senseLastAdj = now;
+    nfLastDecay  = now;
+  } else if (reason == INT_D) {
+    Serial.println("[D] disturber");
+    tightenFilters();
+    senseLastAdj = now;
+  } else if (reason == INT_L) {
     uint32_t e = readEnergy();
-    uint8_t  d = readReg(0x07) & 0x3F;
-    if (d == 0x00) d = 0x01;
-
+    uint8_t  d = readReg(REG_DISTANCE) & DIST_FIELD_MASK;
     strikeCount++;
-    lastEnergy = e;
-    lastDist   = d;
+    lastEnergy   = e;
+    lastDistRaw  = d;
+    lastStrikeMs = now;
     if (e > maxEnergy) maxEnergy = e;
     pushTick(e);
-
-    Serial.print("⚡ #"); Serial.print(strikeCount);
-    Serial.print(" D:");   Serial.print(lastDist);
-    Serial.print("km E:"); Serial.println(lastEnergy);
-
+    Serial.printf("strike #%d d=0x%02X e=%lu\n",
+                  strikeCount, d, (unsigned long)e);
     flashScreen();
   }
 
-  // ── Auto-recover sensitivity every 15s ────────────────────
-  if (millis() - senseLastAdj > SENSE_INCREASE_INTERVAL) {
-    senseLastAdj = millis();
-    Serial.println("[TUNE] Quiet — easing sensitivity down");
-    decreaseSensitivity();
+  if (now - senseLastAdj > SENSE_EASE_MS) {
+    senseLastAdj = now;
+    loosenFilters();
+  }
+  if (now - nfLastDecay > NF_DECAY_MS) {
+    nfLastDecay = now;
+    lowerNoiseFloor();
+  }
+  if (now - lastIrqMs > SENSOR_WDT_MS) {
+    Serial.println("[WDT] no IRQ in watchdog window — re-init");
+    sensorOk = initAS3935();
+    lastIrqMs = now;
   }
 
   radarAngle += 2.5f;
-  if (radarAngle >= 360) radarAngle = 0;
+  if (radarAngle >= 360) radarAngle -= 360;
 
   drawUI();
   delay(50);
