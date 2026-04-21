@@ -917,13 +917,17 @@ void enterLightSleep() {
   uint32_t slept = millis() - t0;
 
   esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-  Serial.printf("[sleep] woke cause=%d after %lums\r\n",
-                (int)cause, (unsigned long)slept);
+  bool fromAs3935 = (digitalRead(AS3935_INT_PIN) == HIGH);
+  bool fromTouch  = (digitalRead(TOUCH_INT)      == LOW);
+  Serial.printf("[sleep] woke cause=%d as3935=%d touch=%d after %lums\r\n",
+                (int)cause, fromAs3935, fromTouch, (unsigned long)slept);
 
-  markActivity();            // reset timers, re-enable backlight
-  // If the AS3935 fired, the ISR may or may not have caught the
-  // edge while sleeping; force a poll either way.
-  if (digitalRead(AS3935_INT_PIN) == HIGH) as3935IrqPending = true;
+  // Only touch unconditionally wakes the display. An AS3935 event
+  // gets deferred to the main loop — if it's a strike the handler
+  // will call markActivity() and turn the screen on; if it's a
+  // disturber we process silently and fall back to sleep.
+  if (fromTouch) markActivity();
+  if (fromAs3935) as3935IrqPending = true;
 }
 
 void setAfeMode(uint8_t gbValue) {
@@ -1303,19 +1307,23 @@ void loop() {
       }
     } else {
       uint8_t reason = intReg & INT_MASK;
-      if (reason != 0) {
-        lastIrqMs = now;
-        markActivity();
-      }
+      if (reason != 0) lastIrqMs = now;   // sensor-watchdog only
+
+      // markActivity() is called only for user-facing events:
+      //   strikes, touches, and NH-with-fault. Raw disturbers and
+      //   NF-ratchet events happen silently so they don't prevent
+      //   the power-saving timers from ever reaching their goal.
       if (reason == INT_NH) {
         Serial.println("[NH] noise floor too high");
         raiseNoiseFloor();
         senseLastAdj = now;
         nfLastDecay  = now;
+        if (noiseFault) markActivity();   // wake to show ENV TOO NOISY
       } else if (reason == INT_D) {
         Serial.println("[D] disturber");
         tightenFilters();
         senseLastAdj = now;
+        // silent — no markActivity
       } else if (reason == INT_L) {
         uint32_t e = readEnergy();
         uint8_t  d = readReg(REG_DISTANCE) & DIST_FIELD_MASK;
@@ -1327,6 +1335,7 @@ void loop() {
         pushTick(e);
         Serial.printf("strike #%d d=0x%02X e=%lu\r\n",
                       strikeCount, d, (unsigned long)e);
+        markActivity();
         flashScreen();
       }
     }
