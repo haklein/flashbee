@@ -125,6 +125,12 @@ TFT_eSprite spr = TFT_eSprite(&tft);
 #define DIST_STALE_MS       300000UL  // dim the hero value after 5 min
 #define SENSOR_WDT_MS       600000UL  // re-init if no IRQ in 10 min
 
+// Safety thresholds. NWS 30/30 rule: anything inside ~10 km means
+// the next strike could be on top of you; stay in shelter until
+// 30 min after the last close strike.
+#define CLOSE_STRIKE_KM     10
+#define DANGER_WINDOW_MS    (30UL * 60UL * 1000UL)
+
 #define NVS_NAMESPACE       "flashbee"
 #define NVS_KEY_TUNCAP      "tuncap"
 #define NVS_KEY_TUNHZ       "tunhz"
@@ -199,12 +205,13 @@ uint32_t senseLastAdj = 0;
 uint32_t nfLastDecay  = 0;
 uint32_t lastIrqMs    = 0;
 
-int      strikeCount  = 0;
-uint32_t maxEnergy    = 0;
-uint32_t lastEnergy   = 0;
-uint8_t  lastDistRaw  = DIST_UNKNOWN;
-uint32_t lastStrikeMs = 0;
-float    radarAngle   = 0;
+int      strikeCount       = 0;
+uint32_t maxEnergy         = 0;
+uint32_t lastEnergy        = 0;
+uint8_t  lastDistRaw       = DIST_UNKNOWN;
+uint32_t lastStrikeMs      = 0;
+uint32_t lastCloseStrikeMs = 0;   // 0 = no close strike seen yet
+float    radarAngle        = 0;
 
 bool     sensorOk     = false;
 bool     noiseFault   = false;
@@ -487,10 +494,24 @@ void drawUI() {
                CX + (int)(86 * cos(rad)),
                CY + (int)(86 * sin(rad)), 0x05C0);
 
+  // Danger-window calculation: did we see a close strike in the
+  // last 30 minutes? If yes, the whole UI flips into alarm mode.
+  uint32_t nowMs = millis();
+  bool dangerActive = (lastCloseStrikeMs > 0) &&
+                      ((nowMs - lastCloseStrikeMs) < DANGER_WINDOW_MS);
+  uint32_t dangerElapsed = dangerActive ? (nowMs - lastCloseStrikeMs) : 0;
+
   spr.setTextDatum(TC_DATUM);
-  spr.setTextColor(C_GREY, C_BG);
   spr.setTextSize(1);
-  spr.drawString("LIGHTNING DETECTOR", CX, 16);
+  if (dangerActive) {
+    // Blink red / orange at 2 Hz so it catches peripheral vision.
+    bool blinkOn = (nowMs / 500) & 1;
+    spr.setTextColor(blinkOn ? C_RED : C_ORANGE, C_BG);
+    spr.drawString("!! SHELTER !!", CX, 16);
+  } else {
+    spr.setTextColor(C_GREY, C_BG);
+    spr.drawString("LIGHTNING DETECTOR", CX, 16);
+  }
 
   if (noiseFault) {
     spr.setTextColor(C_RED, C_BG);
@@ -506,7 +527,7 @@ void drawUI() {
   // Hero distance.
   spr.setTextDatum(MC_DATUM);
   bool stale = strikeCount > 0 && (millis() - lastStrikeMs) > DIST_STALE_MS;
-  uint16_t heroColor = stale ? C_DIM : C_GOLD;
+  uint16_t heroColor = dangerActive ? C_RED : (stale ? C_DIM : C_GOLD);
 
   if (strikeCount == 0) {
     spr.setTextColor(C_DIM, C_BG);
@@ -544,14 +565,30 @@ void drawUI() {
   spr.drawString(String(strikeCount), 40, 156);
 
   spr.setTextDatum(MR_DATUM);
-  spr.setTextColor(C_GREY, C_BG);
-  spr.setTextSize(1);
-  spr.drawString("ENERGY", 200, 140);
-  spr.setTextColor(energyColor(lastEnergy), C_BG);
-  spr.setTextSize(2);
-  String eStr = lastEnergy > 999 ? String(lastEnergy / 1000) + "K"
-                                 : String(lastEnergy);
-  spr.drawString(eStr, 200, 156);
+  if (dangerActive) {
+    // Shelter countdown: how long until the 30/30 safe window clears.
+    // Display counts the minutes elapsed since last close strike so
+    // the user can reason about when they can move again (NWS: wait
+    // 30 min after last close strike).
+    spr.setTextColor(C_RED, C_BG);
+    spr.setTextSize(1);
+    spr.drawString("SHELTER", 200, 140);
+    uint32_t secs = dangerElapsed / 1000;
+    char buf[12];
+    snprintf(buf, sizeof(buf), "%lu:%02lu",
+             (unsigned long)(secs / 60), (unsigned long)(secs % 60));
+    spr.setTextSize(2);
+    spr.drawString(buf, 200, 156);
+  } else {
+    spr.setTextColor(C_GREY, C_BG);
+    spr.setTextSize(1);
+    spr.drawString("ENERGY", 200, 140);
+    spr.setTextColor(energyColor(lastEnergy), C_BG);
+    spr.setTextSize(2);
+    String eStr = lastEnergy > 999 ? String(lastEnergy / 1000) + "K"
+                                   : String(lastEnergy);
+    spr.drawString(eStr, 200, 156);
+  }
 
   int bax = 32, bay = 176, baw = 176, bah = 30;
   int bw  = baw / MAX_TICKS - 1;
@@ -1361,8 +1398,18 @@ void loop() {
         lastStrikeMs = now;
         if (e > maxEnergy) maxEnergy = e;
         pushTick(e);
-        Serial.printf("strike #%d d=0x%02X e=%lu\r\n",
-                      strikeCount, d, (unsigned long)e);
+        // Close-strike marker: overhead (0x01 = <6 km) or any
+        // bin reporting <= CLOSE_STRIKE_KM km, but not 0x3F (OOR)
+        // and not 0x00 (unknown).
+        bool close = (d == DIST_OVERHEAD) ||
+                     (d >= 5 && d <= CLOSE_STRIKE_KM);
+        if (close) {
+          lastCloseStrikeMs = now;
+          Serial.println("⚠ CLOSE STRIKE - SHELTER NOW");
+        }
+        Serial.printf("strike #%d d=0x%02X e=%lu%s\r\n",
+                      strikeCount, d, (unsigned long)e,
+                      close ? " [CLOSE]" : "");
         markActivity();
         flashScreen();
       }
