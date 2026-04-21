@@ -172,6 +172,14 @@ int16_t  touchDownX    = -1, touchDownY = -1;
 int16_t  touchX        = -1, touchY = -1;
 uint32_t touchDownMs   = 0;
 
+// Button press-flash feedback. Keeps a button filled for a short
+// window after it's tapped so the user sees the action register
+// even when the underlying value didn't visibly change.
+enum ButtonId : int8_t { BTN_NONE = -1, BTN_INDOOR = 0, BTN_OUTDOOR = 1, BTN_RESET = 2 };
+ButtonId flashButton    = BTN_NONE;
+uint32_t flashUntilMs   = 0;
+#define  BTN_FLASH_MS   350
+
 Preferences prefs;
 
 // ── Ticker ──────────────────────────────────────────────────────
@@ -737,19 +745,28 @@ void onSwipe() {
   currentScreen = (currentScreen == SCREEN_MAIN) ? SCREEN_SETTINGS : SCREEN_MAIN;
 }
 
+void flashFeedback(ButtonId which) {
+  flashButton  = which;
+  flashUntilMs = millis() + BTN_FLASH_MS;
+}
+
 void onTap(int16_t x, int16_t y) {
+  Serial.printf("[touch] tap %d,%d screen=%u\r\n", x, y, (unsigned)currentScreen);
   if (currentScreen != SCREEN_SETTINGS) return;
   // INDOOR button: x=40..110, y=80..120
   if (x >= 40 && x <= 110 && y >= 80 && y <= 120) {
     setAfeMode(AFE_GB_INDOOR);
+    flashFeedback(BTN_INDOOR);
   }
   // OUTDOOR button: x=130..200, y=80..120
   else if (x >= 130 && x <= 200 && y >= 80 && y <= 120) {
     setAfeMode(AFE_GB_OUTDOOR);
+    flashFeedback(BTN_OUTDOOR);
   }
   // RESET FILTERS button: x=50..190, y=150..190
   else if (x >= 50 && x <= 190 && y >= 150 && y <= 190) {
     resetFilters();
+    flashFeedback(BTN_RESET);
   }
 }
 
@@ -762,6 +779,7 @@ void pollTouch() {
         touchDownX  = rx;
         touchDownY  = ry;
         touchDownMs = millis();
+        Serial.printf("[touch] down %d,%d\r\n", rx, ry);
       }
       touchX = rx;
       touchY = ry;
@@ -775,6 +793,8 @@ void pollTouch() {
     int16_t adx = dx < 0 ? -dx : dx;
     int16_t ady = dy < 0 ? -dy : dy;
     uint32_t held = millis() - touchDownMs;
+    Serial.printf("[touch] up %d,%d dx=%d dy=%d held=%ums\r\n",
+                  touchX, touchY, dx, dy, (unsigned)held);
     if (adx > SWIPE_MIN_PX && adx > ady) {
       onSwipe();
     } else if (adx < TAP_MAX_PX && ady < TAP_MAX_PX && held < TAP_MAX_MS) {
@@ -803,24 +823,45 @@ void drawSettings() {
   spr.setTextSize(1);
   spr.drawString("AFE MODE", CX, 66);
 
+  bool flashActive = (flashButton != BTN_NONE && millis() < flashUntilMs);
+
   // INDOOR / OUTDOOR buttons
-  uint16_t inBorder  = !outdoorMode ? C_GOLD   : C_DIM;
-  uint16_t inText    = !outdoorMode ? C_GOLD   : C_GREY;
-  uint16_t outBorder = outdoorMode  ? C_GOLD   : C_DIM;
-  uint16_t outText   = outdoorMode  ? C_GOLD   : C_GREY;
-  spr.drawRoundRect(40, 80, 70, 40, 5, inBorder);
-  spr.drawRoundRect(130, 80, 70, 40, 5, outBorder);
-  if (!outdoorMode) spr.drawRoundRect(41, 81, 68, 38, 4, inBorder);
-  else              spr.drawRoundRect(131, 81, 68, 38, 4, outBorder);
-  spr.setTextColor(inText, C_BG);
-  spr.drawString("INDOOR",  75,  100);
-  spr.setTextColor(outText, C_BG);
+  uint16_t inBorder  = !outdoorMode ? C_GOLD : C_DIM;
+  uint16_t outBorder = outdoorMode  ? C_GOLD : C_DIM;
+  bool flashIn  = flashActive && flashButton == BTN_INDOOR;
+  bool flashOut = flashActive && flashButton == BTN_OUTDOOR;
+
+  if (flashIn) {
+    spr.fillRoundRect(40, 80, 70, 40, 5, C_GOLD);
+    spr.setTextColor(C_BG, C_GOLD);
+  } else {
+    spr.drawRoundRect(40, 80, 70, 40, 5, inBorder);
+    if (!outdoorMode) spr.drawRoundRect(41, 81, 68, 38, 4, inBorder);
+    spr.setTextColor(!outdoorMode ? C_GOLD : C_GREY, C_BG);
+  }
+  spr.drawString("INDOOR", 75, 100);
+
+  if (flashOut) {
+    spr.fillRoundRect(130, 80, 70, 40, 5, C_GOLD);
+    spr.setTextColor(C_BG, C_GOLD);
+  } else {
+    spr.drawRoundRect(130, 80, 70, 40, 5, outBorder);
+    if (outdoorMode) spr.drawRoundRect(131, 81, 68, 38, 4, outBorder);
+    spr.setTextColor(outdoorMode ? C_GOLD : C_GREY, C_BG);
+  }
   spr.drawString("OUTDOOR", 165, 100);
 
   // RESET FILTERS button
-  spr.drawRoundRect(50, 150, 140, 40, 5, C_ORANGE);
-  spr.setTextColor(C_ORANGE, C_BG);
-  spr.drawString("RESET FILTERS", CX, 170);
+  bool flashReset = flashActive && flashButton == BTN_RESET;
+  if (flashReset) {
+    spr.fillRoundRect(50, 150, 140, 40, 5, C_ORANGE);
+    spr.setTextColor(C_BG, C_ORANGE);
+    spr.drawString("RESET!", CX, 170);
+  } else {
+    spr.drawRoundRect(50, 150, 140, 40, 5, C_ORANGE);
+    spr.setTextColor(C_ORANGE, C_BG);
+    spr.drawString("RESET FILTERS", CX, 170);
+  }
 
   // Status footer
   spr.setTextColor(C_GREY, C_BG);
