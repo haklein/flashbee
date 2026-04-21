@@ -126,6 +126,19 @@ TFT_eSprite spr = TFT_eSprite(&tft);
 #define NVS_NAMESPACE       "flashbee"
 #define NVS_KEY_TUNCAP      "tuncap"
 #define NVS_KEY_TUNHZ       "tunhz"
+#define NVS_KEY_AFE         "afe"
+
+// Touch controller (CHSC6X) shares Wire with the AS3935. Different
+// address (0x2E vs 0x03), so no bus conflict.
+#define TOUCH_I2C_ADDR      0x2E
+#ifndef TOUCH_INT
+  #define TOUCH_INT         D7
+#endif
+// Swipe: |dx| must exceed this to count (pixels).
+#define SWIPE_MIN_PX        50
+// Tap: |dx|, |dy| must be under this, and held less than this time.
+#define TAP_MAX_PX          15
+#define TAP_MAX_MS          700
 
 // ── Sensor + UI state ──────────────────────────────────────────
 uint8_t  noiseFloor   = 2;
@@ -144,11 +157,20 @@ float    radarAngle   = 0;
 
 bool     sensorOk     = false;
 bool     noiseFault   = false;
-const bool outdoorMode = (AS3935_AFE_GB == AFE_GB_OUTDOOR);
+uint8_t  activeAfeGb  = AS3935_AFE_GB;     // full reg byte value, bits [5:1]
+bool     outdoorMode  = (AS3935_AFE_GB == AFE_GB_OUTDOOR);
 uint8_t  i2cFailStreak = 0;
 
 uint8_t  activeTunCap = AS3935_TUN_CAP;   // overridden from NVS at boot
 uint32_t activeLcoHz  = 0;                 // 0 = untuned / unknown
+
+enum Screen : uint8_t { SCREEN_MAIN = 0, SCREEN_SETTINGS = 1 };
+Screen   currentScreen = SCREEN_MAIN;
+
+bool     touchPressed  = false;
+int16_t  touchDownX    = -1, touchDownY = -1;
+int16_t  touchX        = -1, touchY = -1;
+uint32_t touchDownMs   = 0;
 
 Preferences prefs;
 
@@ -261,8 +283,8 @@ bool initAS3935() {
     return false;
   }
 
-  // 3. AFE gain + PWD=0.
-  if (!maskWrite(REG_AFE_GAIN, AFE_GB_FIELD_MASK | PWD_BIT, AS3935_AFE_GB))
+  // 3. AFE gain + PWD=0 (runtime value, may have been overridden from NVS).
+  if (!maskWrite(REG_AFE_GAIN, AFE_GB_FIELD_MASK | PWD_BIT, activeAfeGb))
     return false;
 
   // 4. Antenna tune cap (from NVS if calibrated, else build-time default).
@@ -346,6 +368,7 @@ void drawSensorLost() {
 // ── Main UI ────────────────────────────────────────────────────
 void drawUI() {
   if (!sensorOk) { drawSensorLost(); return; }
+  if (currentScreen == SCREEN_SETTINGS) { drawSettings(); return; }
 
   spr.fillSprite(C_BG);
   float pct = (lastEnergy > 0) ? constrain(lastEnergy / 2097151.0f, 0.f, 1.f) : 0;
@@ -591,7 +614,7 @@ bool runAntennaTune() {
   for (uint8_t cap = 0; cap < 16; cap++) {
     freqs[cap] = measureLcoHz(cap, TUNE_WINDOW_MS);
     int32_t dev = (int32_t)freqs[cap] - (int32_t)LCO_EXPECTED_HZ;
-    Serial.printf("TUN_CAP=%2u -> %5lu Hz (%+5ld)\n",
+    Serial.printf("TUN_CAP=%2u -> %5lu Hz (%+5ld)\r\n",
                   cap, (unsigned long)freqs[cap], (long)dev);
     if (freqs[cap] > maxHz) maxHz = freqs[cap];
     int32_t adev = dev < 0 ? -dev : dev;
@@ -615,7 +638,7 @@ bool runAntennaTune() {
   }
 
   bool inTol = (bestAbsDev <= (int32_t)LCO_TOL_HZ);
-  Serial.printf("best: TUN_CAP=%u @ %lu Hz (dev %+ld, %s)\n",
+  Serial.printf("best: TUN_CAP=%u @ %lu Hz (dev %+ld, %s)\r\n",
                 bestCap, (unsigned long)freqs[bestCap],
                 (long)((int32_t)freqs[bestCap] - (int32_t)LCO_EXPECTED_HZ),
                 inTol ? "WITHIN TOL" : "OUT OF TOL");
@@ -654,6 +677,164 @@ bool pollForTuneCmd(uint32_t windowMs) {
   return false;
 }
 
+// ── Runtime settings (touch-UI hooks) ──────────────────────────
+void setAfeMode(uint8_t gbValue) {
+  // Clamp to the two datasheet values; anything else is ignored.
+  if (gbValue != AFE_GB_INDOOR && gbValue != AFE_GB_OUTDOOR) return;
+  activeAfeGb  = gbValue;
+  outdoorMode  = (gbValue == AFE_GB_OUTDOOR);
+  if (sensorOk) {
+    maskWrite(REG_AFE_GAIN, AFE_GB_FIELD_MASK | PWD_BIT, activeAfeGb);
+  }
+  prefs.begin(NVS_NAMESPACE, false);
+  prefs.putUChar(NVS_KEY_AFE, activeAfeGb);
+  prefs.end();
+  Serial.printf("[afe] mode -> %s\r\n", outdoorMode ? "OUTDOOR" : "INDOOR");
+}
+
+// Clear NF/WD/SR back to defaults, clear AS3935 lightning stats (datasheet
+// §8.7: toggle CL_STAT 1 -> 0 -> 1 to flush the running energy window),
+// reset the local UI counters so the ticker is empty.
+void resetFilters() {
+  noiseFloor = 2; watchdogLvl = 2; spikeRej = 2;
+  if (sensorOk) {
+    writeReg(REG_NF_WDG, (noiseFloor << 4) | (watchdogLvl & WDTH_MASK));
+    maskWrite(REG_CLSTAT_SREJ, SREJ_MASK, spikeRej & SREJ_MASK);
+    maskWrite(REG_CLSTAT_SREJ, CL_STAT_BIT, CL_STAT_BIT);
+    delay(2);
+    maskWrite(REG_CLSTAT_SREJ, CL_STAT_BIT, 0);
+    delay(2);
+    maskWrite(REG_CLSTAT_SREJ, CL_STAT_BIT, CL_STAT_BIT);
+  }
+  noiseFault   = false;
+  strikeCount  = 0;
+  lastEnergy   = 0;
+  maxEnergy    = 0;
+  lastDistRaw  = DIST_UNKNOWN;
+  lastStrikeMs = 0;
+  tickHead     = 0;
+  tickCount    = 0;
+  memset(tickEnergy, 0, sizeof(tickEnergy));
+  Serial.println("[filters] reset: NF=2 WD=2 SR=2, stats cleared");
+}
+
+// ── Touch (CHSC6X @ 0x2E) ──────────────────────────────────────
+bool touchReadPoint(int16_t &x, int16_t &y) {
+  uint8_t n = Wire.requestFrom((uint8_t)TOUCH_I2C_ADDR, (uint8_t)5);
+  if (n != 5) return false;
+  uint8_t b[5];
+  for (uint8_t i = 0; i < 5; i++) {
+    if (!Wire.available()) return false;
+    b[i] = Wire.read();
+  }
+  if (b[0] != 0x01) return false;   // no touch point reported
+  x = b[2];
+  y = b[4];
+  return true;
+}
+
+void onSwipe() {
+  currentScreen = (currentScreen == SCREEN_MAIN) ? SCREEN_SETTINGS : SCREEN_MAIN;
+}
+
+void onTap(int16_t x, int16_t y) {
+  if (currentScreen != SCREEN_SETTINGS) return;
+  // INDOOR button: x=40..110, y=80..120
+  if (x >= 40 && x <= 110 && y >= 80 && y <= 120) {
+    setAfeMode(AFE_GB_INDOOR);
+  }
+  // OUTDOOR button: x=130..200, y=80..120
+  else if (x >= 130 && x <= 200 && y >= 80 && y <= 120) {
+    setAfeMode(AFE_GB_OUTDOOR);
+  }
+  // RESET FILTERS button: x=50..190, y=150..190
+  else if (x >= 50 && x <= 190 && y >= 150 && y <= 190) {
+    resetFilters();
+  }
+}
+
+void pollTouch() {
+  bool isLow = (digitalRead(TOUCH_INT) == LOW);
+  if (isLow) {
+    int16_t rx, ry;
+    if (touchReadPoint(rx, ry)) {
+      if (!touchPressed) {
+        touchDownX  = rx;
+        touchDownY  = ry;
+        touchDownMs = millis();
+      }
+      touchX = rx;
+      touchY = ry;
+      touchPressed = true;
+    }
+    return;
+  }
+  if (touchPressed) {
+    int16_t dx = touchX - touchDownX;
+    int16_t dy = touchY - touchDownY;
+    int16_t adx = dx < 0 ? -dx : dx;
+    int16_t ady = dy < 0 ? -dy : dy;
+    uint32_t held = millis() - touchDownMs;
+    if (adx > SWIPE_MIN_PX && adx > ady) {
+      onSwipe();
+    } else if (adx < TAP_MAX_PX && ady < TAP_MAX_PX && held < TAP_MAX_MS) {
+      onTap(touchX, touchY);
+    }
+    touchPressed = false;
+  }
+}
+
+// ── Settings screen ────────────────────────────────────────────
+void drawSettings() {
+  spr.fillSprite(C_BG);
+  spr.drawCircle(CX, CY, 119, C_DIMRING);
+
+  spr.setTextDatum(TC_DATUM);
+  spr.setTextColor(C_GOLD, C_BG);
+  spr.setTextSize(2);
+  spr.drawString("SETTINGS", CX, 14);
+  spr.setTextSize(1);
+  spr.setTextColor(C_GREY, C_BG);
+  spr.drawString("swipe to return", CX, 36);
+
+  // AFE mode header
+  spr.setTextDatum(MC_DATUM);
+  spr.setTextColor(C_GREY, C_BG);
+  spr.setTextSize(1);
+  spr.drawString("AFE MODE", CX, 66);
+
+  // INDOOR / OUTDOOR buttons
+  uint16_t inBorder  = !outdoorMode ? C_GOLD   : C_DIM;
+  uint16_t inText    = !outdoorMode ? C_GOLD   : C_GREY;
+  uint16_t outBorder = outdoorMode  ? C_GOLD   : C_DIM;
+  uint16_t outText   = outdoorMode  ? C_GOLD   : C_GREY;
+  spr.drawRoundRect(40, 80, 70, 40, 5, inBorder);
+  spr.drawRoundRect(130, 80, 70, 40, 5, outBorder);
+  if (!outdoorMode) spr.drawRoundRect(41, 81, 68, 38, 4, inBorder);
+  else              spr.drawRoundRect(131, 81, 68, 38, 4, outBorder);
+  spr.setTextColor(inText, C_BG);
+  spr.drawString("INDOOR",  75,  100);
+  spr.setTextColor(outText, C_BG);
+  spr.drawString("OUTDOOR", 165, 100);
+
+  // RESET FILTERS button
+  spr.drawRoundRect(50, 150, 140, 40, 5, C_ORANGE);
+  spr.setTextColor(C_ORANGE, C_BG);
+  spr.drawString("RESET FILTERS", CX, 170);
+
+  // Status footer
+  spr.setTextColor(C_GREY, C_BG);
+  char buf[32];
+  snprintf(buf, sizeof(buf), "CAP %u  LCO %lu Hz",
+           activeTunCap, (unsigned long)activeLcoHz);
+  spr.drawString(buf, CX, 210);
+  snprintf(buf, sizeof(buf), "NF %u  WD %u  SR %u",
+           noiseFloor, watchdogLvl, spikeRej);
+  spr.drawString(buf, CX, 222);
+
+  spr.pushSprite(0, 0);
+}
+
 // ── Setup ──────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
@@ -669,19 +850,29 @@ void setup() {
   Wire.setClock(I2C_HZ);
   Wire.setTimeOut(I2C_TIMEOUT_MS);
 
-  // Load saved antenna calibration, if any.
+  // Load saved antenna calibration + AFE mode, if any.
   prefs.begin(NVS_NAMESPACE, true);
   bool haveSavedTune = prefs.isKey(NVS_KEY_TUNCAP);
   if (haveSavedTune) {
     activeTunCap = prefs.getUChar(NVS_KEY_TUNCAP, AS3935_TUN_CAP);
     activeLcoHz  = prefs.getUInt (NVS_KEY_TUNHZ, 0);
   }
+  if (prefs.isKey(NVS_KEY_AFE)) {
+    uint8_t savedAfe = prefs.getUChar(NVS_KEY_AFE, AS3935_AFE_GB);
+    if (savedAfe == AFE_GB_INDOOR || savedAfe == AFE_GB_OUTDOOR) {
+      activeAfeGb = savedAfe;
+      outdoorMode = (savedAfe == AFE_GB_OUTDOOR);
+    }
+  }
   prefs.end();
+
+  // Touch INT pin (CHSC6X controller). Idle-high, pulled low on touch.
+  pinMode(TOUCH_INT, INPUT_PULLUP);
 
   // Prompt for antenna tune over serial. Longer window on first boot
   // (no saved calibration) because the user should really do this.
   if (haveSavedTune) {
-    Serial.printf("[tune] using saved TUN_CAP=%u (LCO %lu Hz)\n",
+    Serial.printf("[tune] using saved TUN_CAP=%u (LCO %lu Hz)\r\n",
                   activeTunCap, (unsigned long)activeLcoHz);
     drawBoot("AS3935", "send 'tune' to recal", C_GREY);
   } else {
@@ -728,12 +919,15 @@ void loop() {
         lastIrqMs = now;
       }
     }
+    pollTouch();
     radarAngle += 2.5f;
     if (radarAngle >= 360) radarAngle -= 360;
     drawUI();
     delay(80);
     return;
   }
+
+  pollTouch();
 
   uint8_t intReg;
   if (!i2cRead(REG_LCO_INT, intReg)) {
@@ -766,7 +960,7 @@ void loop() {
     lastStrikeMs = now;
     if (e > maxEnergy) maxEnergy = e;
     pushTick(e);
-    Serial.printf("strike #%d d=0x%02X e=%lu\n",
+    Serial.printf("strike #%d d=0x%02X e=%lu\r\n",
                   strikeCount, d, (unsigned long)e);
     flashScreen();
   }
