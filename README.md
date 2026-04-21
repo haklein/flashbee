@@ -1,12 +1,13 @@
 # Flash Bee
 
 Handheld lightning sensing and ranging device — a PlatformIO port of
-[biemster's original Instructables build](https://www.instructables.com/Flash-Bee-Handheld-Lighting-Sensing-and-Ranging-De/).
+[gokux's original Instructables build](https://www.instructables.com/Flash-Bee-Handheld-Lighting-Sensing-and-Ranging-De/).
 
-Pairs a **Seeed Studio XIAO ESP32-C3** with a **Seeed Studio Round Display**
-(1.28", GC9A01, 240×240) and the **Grove Lightning Sensor (AS3935)** to show
-strike distance, a radar sweep, per-strike energy, and a short history of the
-last strikes.
+Pairs a **Seeed Studio XIAO ESP32-C3** or **ESP32-C6** with a **Seeed Studio
+Round Display** (1.28", GC9A01, 240×240, v1.1 with the KE switch) and the
+**Grove Lightning Sensor (AS3935)** to show strike distance, per-strike energy,
+a short history of the last strikes, and a big red `SHELTER` warning when a
+strike lands within ~10 km.
 
 ## Credits
 
@@ -19,14 +20,16 @@ last strikes.
 
 ## Hardware
 
-| Part                                      | Role                                 |
-|-------------------------------------------|--------------------------------------|
-| Seeed XIAO ESP32-C3                       | MCU                                  |
-| Seeed Round Display (GC9A01, 240×240)     | UI (SPI)                             |
-| Seeed Grove AS3935                        | Lightning detection (I²C, addr `0x03`) |
+| Part                                        | Role                                   |
+|---------------------------------------------|----------------------------------------|
+| Seeed XIAO ESP32-C3 or ESP32-C6             | MCU (two PIO envs — C6 via pioarduino) |
+| Seeed Round Display v1.1 (GC9A01, 240×240)  | UI (SPI) + capacitive touch + battery  |
+| Seeed Grove AS3935                          | Lightning detection (I²C, addr `0x03`) |
 
-I²C pins (ESP32-C3): `SDA = D4 (GPIO6)`, `SCL = D5 (GPIO7)`. SPI for the
-display is configured via Setup501 in Seeed_GFX.
+Pin assignments use the XIAO silkscreen labels (D0…D10), which map to
+different underlying GPIOs on C3 vs C6 but sit in the same physical
+positions on the board. `SDA = D4`, `SCL = D5`; SPI for the display is
+configured via Setup501 in Seeed_GFX.
 
 ### Extra wire: AS3935 `INT` → XIAO `D2`
 
@@ -38,18 +41,28 @@ resonance and pick the correct `TUN_CAP` value automatically — without
 it, every distance reading is biased. Override the pin with
 `-DAS3935_INT_PIN=<n>` if D2 isn't convenient for your wiring.
 
-### Round Display v1.1 backlight switches
+### Round Display v1.1 KE switch
 
-Seeed Round Display v1.1 (changelog 2023-04-07: "Add a switch to A0
-and D6") has a **2-bit DIP switch** on the back that routes the
-backlight control MOSFET to either A0, D6, or both. The firmware
-drives both pins in sync on every backlight transition, so the
-Tier-2 inactivity timeout works regardless of how the switches are
-set — no need to fiddle with them.
+Per the [Seeed wiki](https://wiki.seeedstudio.com/seeedstudio_round_display_usage/),
+Round Display v1.1 added a 2-bit DIP switch ("KE") in the middle
+of the microSD-slot area. Its two positions mean:
 
-If you repurpose A0 or D6 for something else in your own build,
-override via build flag: `-DTFT_BL_PIN=<n>` and/or
-`-DTFT_BL_PIN_ALT=<n>`.
+- **KE ON** — A0 connects to the onboard battery-voltage divider
+  (R28/R29 → VBAT/2), and D6 connects to the backlight MOSFET
+  gate. This is the configuration the firmware is built around:
+  the settings screen shows `BAT x.xx V  NN%`, and the inactivity
+  timeout cuts the backlight fully.
+- **KE OFF** — A0 and D6 are electrically disconnected from the
+  display module's circuits and become plain XIAO GPIOs for the
+  user to wire as they like. With the switch in this position the
+  backlight stays on permanently regardless of firmware state
+  (still gets `DISPOFF + SLPIN` so the pixels go black), and the
+  battery reading shows `BAT --`.
+
+Firmware never drives A0 (it's an analog input when KE is on, and
+the user's free GPIO when KE is off — either way, actively driving
+it would be wrong). D6 is driven for backlight. Override with
+`-DTFT_BL_PIN=<n>` if you wire it differently.
 
 > **Safety disclaimer.** This is a hobby device. Do **not** use it as your
 > sole basis for deciding whether it is safe to be outdoors. The AS3935 is
@@ -93,22 +106,69 @@ src/main.ino            # single-file firmware
 
 ## What it shows
 
+Main screen:
+
 - **Big yellow number** — estimated distance in km, or `OVERHEAD` / `>40` /
   `-- distance unknown`.
-- **Arc gauge** — last-strike energy (0-21 bit AS3935 word) mapped 0-100%.
-- **Radar sweep** — decorative, not a bearing indicator (single-antenna
-  detector: no direction-finding).
+- **Arc gauge** — last-strike energy (0–21 bit AS3935 word) mapped 0–100 %.
+- **Inward-pulsing concentric rings** — "listening" indicator. Purely
+  radial (the AS3935 is non-directional — any rotating element would
+  falsely imply bearing capability). Green-teal normally, red-amber
+  during the shelter window.
 - **Strikes / Energy** — running count and last-strike energy.
-- **Energy history** — 20-slot ring buffer bar chart. Labelled `(stale)`
+- **Energy history** — 20-slot ring-buffer bar chart. Labelled `(stale)`
   once the last strike is more than 5 min old.
-- **Status line under the title** — `OUT/IN WD:n SR:n` (current AFE mode +
-  filter levels). Turns amber when filters have tightened beyond
+- **Status line under the title** — `OUT/IN WD:n SR:n` (current AFE mode
+  + filter levels). Turns amber when filters have tightened beyond
   mid-range, red `ENV TOO NOISY` when the noise floor has hit the
-  hardware ceiling and the chip is no longer operating within its
-  acceptable input-noise range.
+  hardware ceiling and the chip is no longer operating within spec.
+- **`!! SHELTER !!` overlay** — blinks red/amber when a strike is
+  detected within ~10 km (close threshold per NWS 30/30 rule). The
+  right-side footer swaps to `SHELTER m:ss` counting up from the
+  last close strike. Clears automatically 30 minutes after the
+  last close strike.
 - **`SENSOR LOST` overlay** — shown when I²C has failed 8+ times in a
   row; the firmware keeps retrying `initAS3935()` every 3 s until
   the sensor comes back.
+
+Settings screen (swipe horizontally):
+
+- **INDOOR / OUTDOOR** — AFE gain toggle, persisted to NVS.
+- **SCREEN** — backlight inactivity timeout (30 s … NEVER).
+- **SLEEP** — light-sleep inactivity timeout (5 min … NEVER). Wakes
+  on strike, disturber (silent), or any touch.
+- **RESET FILTERS** — restores NF/WD/SR to defaults, clears AS3935
+  lightning statistics via the `CL_STAT` toggle. Does *not* clear
+  the shelter timer (safety: no UI-level "pretend it's safe" button).
+- **Footer** — `BAT x.xx V  NN%` live battery readout (Round Display
+  v1.1 KE switch ON) and `NF  WD  SR` current AS3935 filter state.
+
+## Power management
+
+Three tiers, all individually configurable from the settings screen
+and persisted across power cycles:
+
+1. **Interrupt-driven AS3935.** `D2` receives a hardware IRQ from the
+   module (see wiring section above). The firmware never polls — it
+   reacts in microseconds and the I²C bus is quiet between events.
+2. **Backlight off (Tier 2).** After `SCREEN` minutes of no touches
+   and no strikes, `D6` goes low and the GC9A01 enters `DISPOFF` +
+   `SLPIN`. Disturbers / noise-floor events don't reset this timer
+   — they still get processed silently, they just don't wake the
+   display.
+3. **CPU light sleep (Tier 3).** After `SLEEP` minutes more, the
+   ESP32 enters `esp_light_sleep_start()`. Wake sources: AS3935 INT
+   rising (strike/disturber) or touch going low. A strike wakes the
+   display; a plain disturber processes silently and goes back to
+   sleep. USB-CDC drops during sleep and re-enumerates on wake.
+
+Estimated current draw on the Trustfire 10440 (300 mAh):
+
+| State              | ~Current | Runtime on 280 mAh usable |
+|--------------------|----------|---------------------------|
+| Main UI active     | 50 mA    | 5.5 h                     |
+| Screen off         | 28 mA    | 10 h                      |
+| Light sleep        | 3–5 mA   | 55–90 h                   |
 
 ## First-time setup — antenna calibration
 
