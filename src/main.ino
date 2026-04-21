@@ -171,7 +171,15 @@ static const char* const SLEEP_LABELS[] = {
   "5 min", "15 min", "30 min", "1 h", "2 h", "NEVER"
 };
 #define SLEEP_OPTIONS_N     6
-#define SLEEP_DEFAULT_IDX   2   // 30 min
+#define SLEEP_DEFAULT_IDX   5   // NEVER — Tier 3 is opt-in until debugged
+
+// Global Tier-3 kill-switch. 0 => the sleep timer is never even
+// evaluated; the UI still shows the SLEEP tile for configurability
+// but the firmware won't try to enter light sleep. Flip to 1 when
+// debugging is done.
+#ifndef ENABLE_LIGHT_SLEEP
+  #define ENABLE_LIGHT_SLEEP 0
+#endif
 
 // Touch controller (CHSC6X) shares Wire with the AS3935. Different
 // address (0x2E vs 0x03), so no bus conflict.
@@ -1182,6 +1190,12 @@ void setup() {
   }
   prefs.end();
 
+#if !ENABLE_LIGHT_SLEEP
+  // Force NEVER while Tier 3 is disabled so the UI doesn't claim a
+  // sleep timeout is active when the firmware can't actually sleep.
+  sleepIdx = SLEEP_OPTIONS_N - 1;
+#endif
+
   // Touch INT pin (CHSC6X controller). Idle-high, pulled low on touch.
   pinMode(TOUCH_INT, INPUT_PULLUP);
 
@@ -1329,13 +1343,15 @@ void loop() {
   }
 
   // Tier-3: after the longer deep-idle window, light-sleep the CPU.
-  // Only entered when the screen is already off and nothing in the
-  // recent past looks fault-ish.
+  // Gated by ENABLE_LIGHT_SLEEP until we've got sleep/wake reliability
+  // tested end-to-end on the board.
+#if ENABLE_LIGHT_SLEEP
   uint32_t sleepMs = SLEEP_OPTIONS_MS[sleepIdx];
   if (!displayOn && !keepOn && sensorOk &&
       sleepMs > 0 && (now - lastActivityMs) > sleepMs) {
     enterLightSleep();
   }
+#endif
 
   if (displayOn) {
     radarAngle += 2.5f;
