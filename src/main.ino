@@ -750,6 +750,28 @@ bool pollForTuneCmd(uint32_t windowMs) {
 }
 
 // ── Battery sense ──────────────────────────────────────────────
+// Piecewise-linear LiPo discharge curve. Approximate, unloaded.
+// Good enough to tell "full" from "half" from "get to a charger".
+uint8_t batteryPercent(uint16_t mv) {
+  static const struct { uint16_t mv; uint8_t pct; } curve[] = {
+    {4200, 100}, {4100, 90}, {4000, 75}, {3900, 55},
+    {3800, 40},  {3700, 25}, {3600, 10}, {3500,  5},
+    {3300,  0},
+  };
+  const int N = sizeof(curve) / sizeof(curve[0]);
+  if (mv >= curve[0].mv)     return 100;
+  if (mv <= curve[N-1].mv)   return 0;
+  for (int i = 0; i < N - 1; i++) {
+    if (mv <= curve[i].mv && mv >= curve[i+1].mv) {
+      uint16_t dmv  = curve[i].mv  - curve[i+1].mv;
+      uint8_t  dpct = curve[i].pct - curve[i+1].pct;
+      return (uint8_t)(curve[i+1].pct +
+             (uint32_t)(mv - curve[i+1].mv) * dpct / dmv);
+    }
+  }
+  return 0;
+}
+
 void updateBattery() {
   uint32_t now = millis();
   if (now - batteryLastMs < BAT_READ_MS && batteryLastMs != 0) return;
@@ -1017,11 +1039,11 @@ void drawSettings() {
   // Status footer
   spr.setTextColor(C_GREY, C_BG);
   if (batteryMv > 0) {
-    snprintf(buf, sizeof(buf), "CAP %u  BAT %u.%02u V",
-             activeTunCap,
-             batteryMv / 1000, (batteryMv % 1000) / 10);
+    snprintf(buf, sizeof(buf), "BAT %u.%02uV  %u%%",
+             batteryMv / 1000, (batteryMv % 1000) / 10,
+             batteryPercent(batteryMv));
   } else {
-    snprintf(buf, sizeof(buf), "CAP %u  BAT --", activeTunCap);
+    snprintf(buf, sizeof(buf), "BAT --");
   }
   spr.drawString(buf, CX, 210);
   snprintf(buf, sizeof(buf), "NF %u  WD %u  SR %u",
