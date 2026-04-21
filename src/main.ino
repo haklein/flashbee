@@ -488,19 +488,26 @@ void drawUI() {
   spr.drawCircle(CX, CY, 90,  C_DIM);
   spr.drawCircle(CX, CY, 58,  C_DIM);
 
-  // "Listening" indicator — two concentric rings expand outward
-  // from the centre and fade as they grow, offset by half a period
-  // so one is always visible. Purely radial — the AS3935 has a
-  // single loop antenna, so anything rotating would be a lie.
-  uint32_t ripplePhase = nowMs % 2000;      // 2 s period
+  // "Listening" indicator — two concentric rings contract from the
+  // outer edge toward the centre (we're receiving, not emitting),
+  // offset by half a period so one is always mid-travel. Purely
+  // radial — the AS3935 has a single loop antenna, any rotating
+  // element would falsely imply directional capability.
+  // Brightness peaks at mid-radius (sin curve) so rings feel like
+  // they're "gathering" toward the device.
+  const uint32_t RIPPLE_MS = 2800;
+  uint32_t ripplePhase = nowMs % RIPPLE_MS;
   for (int i = 0; i < 2; i++) {
-    uint32_t p = (ripplePhase + (uint32_t)(i * 1000)) % 2000;
-    float    t = p / 2000.0f;               // 0..1
-    int      r = 8 + (int)(t * 82);         // 8..90 px radius
-    uint8_t  v = (uint8_t)((1.0f - t) * 40);
-    uint16_t rc = dangerActive ? spr.color565(v, v / 4, 0)   // red-amber
-                               : spr.color565(0, v, v / 3);  // green-teal
-    spr.drawCircle(CX, CY, r, rc);
+    uint32_t p = (ripplePhase + (uint32_t)(i * RIPPLE_MS / 2)) % RIPPLE_MS;
+    float    t = p / (float)RIPPLE_MS;                // 0..1
+    int      r = 90 - (int)(t * 82);                  // 90 -> 8
+    uint8_t  v = (uint8_t)(sinf(t * (float)PI) * 120);
+    uint16_t rc = dangerActive ? spr.color565(v, v / 3, 0)   // red-amber
+                               : spr.color565(0, v, v / 2);  // green-teal
+    // Two overlapping circles at adjacent radii → 2 px thick ring,
+    // much more visible than the single-pixel draw.
+    spr.drawCircle(CX, CY, r,     rc);
+    spr.drawCircle(CX, CY, r - 1, rc);
   }
 
   spr.setTextDatum(TC_DATUM);
