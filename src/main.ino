@@ -880,7 +880,8 @@ bool touchReadPoint(int16_t &x, int16_t &y) {
     if (!Wire.available()) return false;
     b[i] = Wire.read();
   }
-  if (b[0] != 0x01) return false;   // no touch point reported
+  if (b[0] != 0x01) return false;              // no touch point reported
+  if (b[2] >= 240 || b[4] >= 240) return false; // out-of-range = I2C glitch
   x = b[2];
   y = b[4];
   return true;
@@ -1156,6 +1157,18 @@ void loop() {
 
   pollTouch();
   updateBattery();
+
+  // Safety net: AS3935 INT is level-latched, so a failed i2cRead
+  // leaves the pin high with no new rising edge for the ISR. Poll
+  // the pin level twice a second and rescue any stuck-high state.
+  static uint32_t intSafetyMs = 0;
+  if (sensorOk && !as3935IrqPending && (now - intSafetyMs) > 500) {
+    intSafetyMs = now;
+    if (digitalRead(AS3935_INT_PIN) == HIGH) {
+      as3935IrqPending = true;
+      Serial.println("[AS3935] rescued latched INT");
+    }
+  }
 
   // Tier-1: only talk to the AS3935 when its INT pin has asserted.
   if (as3935IrqPending) {
