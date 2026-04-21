@@ -473,26 +473,6 @@ void drawUI() {
   if (currentScreen == SCREEN_SETTINGS) { drawSettings(); return; }
 
   spr.fillSprite(C_BG);
-  float pct = (lastEnergy > 0) ? constrain(lastEnergy / 2097151.0f, 0.f, 1.f) : 0;
-  drawGaugeArc(spr, energyColor(lastEnergy), pct);
-  drawGaugeTicks(spr, 10);
-  spr.drawCircle(CX, CY, 119, 0x2124);
-  spr.drawCircle(CX, CY, 90,  C_DIM);
-  spr.drawCircle(CX, CY, 58,  C_DIM);
-
-  // Decorative radar sweep — AS3935 is non-directional. Position
-  // of the sweep does NOT indicate strike bearing.
-  float rad = radarAngle * DEG_TO_RAD;
-  for (int len = 20; len <= 86; len += 4) {
-    float    tr = (radarAngle - (86 - len) * 0.4f) * DEG_TO_RAD;
-    uint8_t   g = (uint8_t)((len / 86.0f) * 40);
-    spr.drawPixel(CX + (int)(len * cos(tr)),
-                  CY + (int)(len * sin(tr)),
-                  spr.color565(0, g, 0));
-  }
-  spr.drawLine(CX, CY,
-               CX + (int)(86 * cos(rad)),
-               CY + (int)(86 * sin(rad)), 0x05C0);
 
   // Danger-window calculation: did we see a close strike in the
   // last 30 minutes? If yes, the whole UI flips into alarm mode.
@@ -500,6 +480,28 @@ void drawUI() {
   bool dangerActive = (lastCloseStrikeMs > 0) &&
                       ((nowMs - lastCloseStrikeMs) < DANGER_WINDOW_MS);
   uint32_t dangerElapsed = dangerActive ? (nowMs - lastCloseStrikeMs) : 0;
+
+  float pct = (lastEnergy > 0) ? constrain(lastEnergy / 2097151.0f, 0.f, 1.f) : 0;
+  drawGaugeArc(spr, energyColor(lastEnergy), pct);
+  drawGaugeTicks(spr, 10);
+  spr.drawCircle(CX, CY, 119, 0x2124);
+  spr.drawCircle(CX, CY, 90,  C_DIM);
+  spr.drawCircle(CX, CY, 58,  C_DIM);
+
+  // "Listening" indicator — two concentric rings expand outward
+  // from the centre and fade as they grow, offset by half a period
+  // so one is always visible. Purely radial — the AS3935 has a
+  // single loop antenna, so anything rotating would be a lie.
+  uint32_t ripplePhase = nowMs % 2000;      // 2 s period
+  for (int i = 0; i < 2; i++) {
+    uint32_t p = (ripplePhase + (uint32_t)(i * 1000)) % 2000;
+    float    t = p / 2000.0f;               // 0..1
+    int      r = 8 + (int)(t * 82);         // 8..90 px radius
+    uint8_t  v = (uint8_t)((1.0f - t) * 40);
+    uint16_t rc = dangerActive ? spr.color565(v, v / 4, 0)   // red-amber
+                               : spr.color565(0, v, v / 3);  // green-teal
+    spr.drawCircle(CX, CY, r, rc);
+  }
 
   spr.setTextDatum(TC_DATUM);
   spr.setTextSize(1);
@@ -1339,8 +1341,6 @@ void loop() {
       }
     }
     pollTouch();
-    radarAngle += 2.5f;
-    if (radarAngle >= 360) radarAngle -= 360;
     drawUI();
     delay(80);
     return;
@@ -1456,10 +1456,6 @@ void loop() {
   }
 #endif
 
-  if (displayOn) {
-    radarAngle += 2.5f;
-    if (radarAngle >= 360) radarAngle -= 360;
-    drawUI();
-  }
+  if (displayOn) drawUI();
   delay(20);
 }
