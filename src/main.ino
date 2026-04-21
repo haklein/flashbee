@@ -130,8 +130,16 @@ TFT_eSprite spr = TFT_eSprite(&tft);
 #define NVS_KEY_TIMEOUT     "tmout"
 
 // Display backlight pin (GC9A01 via Setup501 puts this on D6).
+// Round Display v1.1 routes the backlight MOSFET through a 2-bit
+// DIP switch selecting A0 / D6 (Seeed changelog 2023-04-07). We
+// drive BOTH pins in sync so the firmware works regardless of how
+// the switches are set. A0/D6 aren't used by anything else in this
+// project, so there's no conflict.
 #ifndef TFT_BL_PIN
   #define TFT_BL_PIN        D6
+#endif
+#ifndef TFT_BL_PIN_ALT
+  #define TFT_BL_PIN_ALT    A0
 #endif
 
 // Inactivity-timeout options for the settings UI. 0 == NEVER.
@@ -737,16 +745,19 @@ bool pollForTuneCmd(uint32_t windowMs) {
 // into SLPIN/DISPOFF so the pixels actually go dark regardless of
 // whether the backlight pin is wired through.
 void setBacklight(bool on) {
-  pinMode(TFT_BL_PIN, OUTPUT);
+  pinMode(TFT_BL_PIN,     OUTPUT);
+  pinMode(TFT_BL_PIN_ALT, OUTPUT);
   if (on) {
     // Wake panel first, then light.
     tft.writecommand(0x11);   // SLPOUT
     delay(5);
     tft.writecommand(0x29);   // DISPON
-    digitalWrite(TFT_BL_PIN, HIGH);
+    digitalWrite(TFT_BL_PIN,     HIGH);
+    digitalWrite(TFT_BL_PIN_ALT, HIGH);
   } else {
     // Light off first, then blank + sleep the panel.
-    digitalWrite(TFT_BL_PIN, LOW);
+    digitalWrite(TFT_BL_PIN,     LOW);
+    digitalWrite(TFT_BL_PIN_ALT, LOW);
     tft.writecommand(0x28);   // DISPOFF — outputs forced black
     tft.writecommand(0x10);   // SLPIN   — internal timing gated
   }
@@ -1032,8 +1043,10 @@ void setup() {
   // Touch INT pin (CHSC6X controller). Idle-high, pulled low on touch.
   pinMode(TOUCH_INT, INPUT_PULLUP);
 
-  // Backlight pin — keep on during boot.
-  pinMode(TFT_BL_PIN, OUTPUT);
+  // Backlight pins — keep on during boot. Drive both A0 and D6 so
+  // the Round Display v1.1 DIP switches can be in any combination.
+  pinMode(TFT_BL_PIN,     OUTPUT);
+  pinMode(TFT_BL_PIN_ALT, OUTPUT);
   setBacklight(true);
   lastActivityMs = millis();
 

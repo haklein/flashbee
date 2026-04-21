@@ -38,16 +38,18 @@ resonance and pick the correct `TUN_CAP` value automatically — without
 it, every distance reading is biased. Override the pin with
 `-DAS3935_INT_PIN=<n>` if D2 isn't convenient for your wiring.
 
-### Round Display v1.1 backlight switch
+### Round Display v1.1 backlight switches
 
-Seeed Round Display v1.1 (changelog: "Add a switch to A0 and D6",
-2023-04-07) routes the backlight control MOSFET through a two-way
-switch on the back of the module. The firmware's Tier-2 inactivity
-timeout drives **D6** low to cut the backlight — so the switch must
-be in the **D6 position**. If it's in the A0 position the backlight
-stays on permanently regardless of what the firmware does, and
-timeout only blanks the pixels via `DISPOFF + SLPIN` (still a ~5×
-controller-side power reduction, but the LED keeps burning).
+Seeed Round Display v1.1 (changelog 2023-04-07: "Add a switch to A0
+and D6") has a **2-bit DIP switch** on the back that routes the
+backlight control MOSFET to either A0, D6, or both. The firmware
+drives both pins in sync on every backlight transition, so the
+Tier-2 inactivity timeout works regardless of how the switches are
+set — no need to fiddle with them.
+
+If you repurpose A0 or D6 for something else in your own build,
+override via build flag: `-DTFT_BL_PIN=<n>` and/or
+`-DTFT_BL_PIN_ALT=<n>`.
 
 > **Safety disclaimer.** This is a hobby device. Do **not** use it as your
 > sole basis for deciding whether it is safe to be outdoors. The AS3935 is
