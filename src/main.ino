@@ -173,12 +173,10 @@ static const char* const SLEEP_LABELS[] = {
 #define SLEEP_OPTIONS_N     6
 #define SLEEP_DEFAULT_IDX   5   // NEVER — Tier 3 is opt-in until debugged
 
-// Global Tier-3 kill-switch. 0 => the sleep timer is never even
-// evaluated; the UI still shows the SLEEP tile for configurability
-// but the firmware won't try to enter light sleep. Flip to 1 when
-// debugging is done.
+// Global Tier-3 kill-switch. Flip to 0 to completely disable light
+// sleep regardless of the NVS-saved value, useful while debugging.
 #ifndef ENABLE_LIGHT_SLEEP
-  #define ENABLE_LIGHT_SLEEP 0
+  #define ENABLE_LIGHT_SLEEP 1
 #endif
 
 // Touch controller (CHSC6X) shares Wire with the AS3935. Different
@@ -891,23 +889,36 @@ void enterLightSleep() {
     as3935IrqPending = true;
     return;
   }
+  // Touch should be idle-high; if it's currently low the user is
+  // pressing right now. Abort so we don't sleep/wake instantly.
+  if (digitalRead(TOUCH_INT) == LOW) {
+    Serial.println("[sleep] abort: touch currently pressed");
+    return;
+  }
 
-  Serial.println("[sleep] entering light sleep");
+  Serial.printf("[sleep] entering light sleep (AS3935=%d TOUCH=%d)\r\n",
+                digitalRead(AS3935_INT_PIN), digitalRead(TOUCH_INT));
   Serial.flush();
 
   // Wake sources — ESP-IDF 5.x API.
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-  gpio_wakeup_enable((gpio_num_t)AS3935_INT_PIN, GPIO_INTR_HIGH_LEVEL);
-  gpio_wakeup_enable((gpio_num_t)TOUCH_INT,      GPIO_INTR_LOW_LEVEL);
-  esp_sleep_enable_gpio_wakeup();
-  // 1-hour safety timer. Even if both GPIOs misbehave we resume
-  // periodically for the sensor-watchdog re-init path.
-  esp_sleep_enable_timer_wakeup((uint64_t)3600ULL * 1000ULL * 1000ULL);
+  esp_err_t e1 = gpio_wakeup_enable((gpio_num_t)AS3935_INT_PIN, GPIO_INTR_HIGH_LEVEL);
+  esp_err_t e2 = gpio_wakeup_enable((gpio_num_t)TOUCH_INT,      GPIO_INTR_LOW_LEVEL);
+  esp_err_t e3 = esp_sleep_enable_gpio_wakeup();
+  esp_err_t e4 = esp_sleep_enable_timer_wakeup((uint64_t)3600ULL * 1000ULL * 1000ULL);
+  if (e1 || e2 || e3 || e4) {
+    Serial.printf("[sleep] wakeup config failed: %d %d %d %d\r\n",
+                  (int)e1, (int)e2, (int)e3, (int)e4);
+    return;
+  }
 
+  uint32_t t0 = millis();
   esp_light_sleep_start();   // blocks until wake event
+  uint32_t slept = millis() - t0;
 
   esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-  Serial.printf("[sleep] woke cause=%d\r\n", (int)cause);
+  Serial.printf("[sleep] woke cause=%d after %lums\r\n",
+                (int)cause, (unsigned long)slept);
 
   markActivity();            // reset timers, re-enable backlight
   // If the AS3935 fired, the ISR may or may not have caught the
