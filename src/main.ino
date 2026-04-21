@@ -732,9 +732,26 @@ bool pollForTuneCmd(uint32_t windowMs) {
 }
 
 // ── Tier-2 backlight + inactivity ──────────────────────────────
+// Some Seeed Round Display revisions have the backlight hardwired
+// on — toggling D6 has no effect. Also drive the GC9A01 controller
+// into SLPIN/DISPOFF so the pixels actually go dark regardless of
+// whether the backlight pin is wired through.
 void setBacklight(bool on) {
-  digitalWrite(TFT_BL_PIN, on ? HIGH : LOW);
+  pinMode(TFT_BL_PIN, OUTPUT);
+  if (on) {
+    // Wake panel first, then light.
+    tft.writecommand(0x11);   // SLPOUT
+    delay(5);
+    tft.writecommand(0x29);   // DISPON
+    digitalWrite(TFT_BL_PIN, HIGH);
+  } else {
+    // Light off first, then blank + sleep the panel.
+    digitalWrite(TFT_BL_PIN, LOW);
+    tft.writecommand(0x28);   // DISPOFF — outputs forced black
+    tft.writecommand(0x10);   // SLPIN   — internal timing gated
+  }
   displayOn = on;
+  Serial.printf("[bl] %s\r\n", on ? "on" : "off");
 }
 
 // Reset the inactivity timer. If the screen was off, wake it.
