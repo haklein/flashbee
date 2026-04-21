@@ -127,6 +127,22 @@ TFT_eSprite spr = TFT_eSprite(&tft);
 #define NVS_KEY_TUNCAP      "tuncap"
 #define NVS_KEY_TUNHZ       "tunhz"
 #define NVS_KEY_AFE         "afe"
+#define NVS_KEY_TIMEOUT     "tmout"
+
+// Display backlight pin (GC9A01 via Setup501 puts this on D6).
+#ifndef TFT_BL_PIN
+  #define TFT_BL_PIN        D6
+#endif
+
+// Inactivity-timeout options for the settings UI. 0 == NEVER.
+static const uint32_t TIMEOUT_OPTIONS_MS[] = {
+  30000UL, 60000UL, 120000UL, 300000UL, 600000UL, 0UL
+};
+static const char* const TIMEOUT_LABELS[] = {
+  "30s", "1 min", "2 min", "5 min", "10 min", "NEVER"
+};
+#define TIMEOUT_OPTIONS_N   6
+#define TIMEOUT_DEFAULT_IDX 2   // 2 min
 
 // Touch controller (CHSC6X) shares Wire with the AS3935. Different
 // address (0x2E vs 0x03), so no bus conflict.
@@ -135,7 +151,7 @@ TFT_eSprite spr = TFT_eSprite(&tft);
   #define TOUCH_INT         D7
 #endif
 // Swipe: |dx| must exceed this to count (pixels).
-#define SWIPE_MIN_PX        50
+#define SWIPE_MIN_PX        25
 // Tap: |dx|, |dy| must be under this, and held less than this time.
 #define TAP_MAX_PX          15
 #define TAP_MAX_MS          700
@@ -175,10 +191,27 @@ uint32_t touchDownMs   = 0;
 // Button press-flash feedback. Keeps a button filled for a short
 // window after it's tapped so the user sees the action register
 // even when the underlying value didn't visibly change.
-enum ButtonId : int8_t { BTN_NONE = -1, BTN_INDOOR = 0, BTN_OUTDOOR = 1, BTN_RESET = 2 };
+enum ButtonId : int8_t {
+  BTN_NONE    = -1,
+  BTN_INDOOR  = 0,
+  BTN_OUTDOOR = 1,
+  BTN_TIMEOUT = 2,
+  BTN_RESET   = 3,
+};
 ButtonId flashButton    = BTN_NONE;
 uint32_t flashUntilMs   = 0;
 #define  BTN_FLASH_MS   350
+
+// Tier-1 interrupt-driven AS3935 handling. The ISR just sets a
+// flag; the event-register read + handling happens in loop context
+// so I²C is not invoked from interrupt context.
+volatile bool as3935IrqPending = false;
+void IRAM_ATTR as3935IrqHandler() { as3935IrqPending = true; }
+
+// Tier-2 backlight / inactivity state.
+bool     displayOn     = true;
+uint32_t lastActivityMs = 0;
+uint8_t  timeoutIdx    = TIMEOUT_DEFAULT_IDX;
 
 Preferences prefs;
 
@@ -312,6 +345,19 @@ bool initAS3935() {
 
   // 7. Unmask disturbers so the tuner can see them.
   if (!maskWrite(REG_LCO_INT, MASK_DIST_BIT, 0)) return false;
+
+  // 8. Hook the hardware IRQ line. Order matters:
+  //    (a) clear any latched event so INT isn't currently high;
+  //    (b) attach RISING-edge ISR;
+  //    (c) if a new event slipped between (a) and (b), the line is
+  //        already high — set the pending flag so we don't miss it.
+  pinMode(AS3935_INT_PIN, INPUT);
+  uint8_t discard;
+  i2cRead(REG_LCO_INT, discard);
+  detachInterrupt(digitalPinToInterrupt(AS3935_INT_PIN));
+  attachInterrupt(digitalPinToInterrupt(AS3935_INT_PIN),
+                  as3935IrqHandler, RISING);
+  if (digitalRead(AS3935_INT_PIN) == HIGH) as3935IrqPending = true;
 
   return true;
 }
@@ -685,7 +731,35 @@ bool pollForTuneCmd(uint32_t windowMs) {
   return false;
 }
 
+// ── Tier-2 backlight + inactivity ──────────────────────────────
+void setBacklight(bool on) {
+  digitalWrite(TFT_BL_PIN, on ? HIGH : LOW);
+  displayOn = on;
+}
+
+// Reset the inactivity timer. If the screen was off, wake it.
+void markActivity() {
+  lastActivityMs = millis();
+  if (!displayOn) {
+    setBacklight(true);
+  }
+}
+
 // ── Runtime settings (touch-UI hooks) ──────────────────────────
+void setTimeoutIdx(uint8_t idx) {
+  if (idx >= TIMEOUT_OPTIONS_N) idx = 0;
+  timeoutIdx = idx;
+  prefs.begin(NVS_NAMESPACE, false);
+  prefs.putUChar(NVS_KEY_TIMEOUT, timeoutIdx);
+  prefs.end();
+  Serial.printf("[timeout] -> %s\r\n", TIMEOUT_LABELS[timeoutIdx]);
+}
+
+void cycleTimeout() {
+  setTimeoutIdx((timeoutIdx + 1) % TIMEOUT_OPTIONS_N);
+  markActivity();  // start the new timer fresh
+}
+
 void setAfeMode(uint8_t gbValue) {
   // Clamp to the two datasheet values; anything else is ignored.
   if (gbValue != AFE_GB_INDOOR && gbValue != AFE_GB_OUTDOOR) return;
@@ -753,18 +827,23 @@ void flashFeedback(ButtonId which) {
 void onTap(int16_t x, int16_t y) {
   Serial.printf("[touch] tap %d,%d screen=%u\r\n", x, y, (unsigned)currentScreen);
   if (currentScreen != SCREEN_SETTINGS) return;
-  // INDOOR button: x=40..110, y=80..120
-  if (x >= 40 && x <= 110 && y >= 80 && y <= 120) {
+  // INDOOR button: x=40..110, y=72..104
+  if (x >= 40 && x <= 110 && y >= 72 && y <= 104) {
     setAfeMode(AFE_GB_INDOOR);
     flashFeedback(BTN_INDOOR);
   }
-  // OUTDOOR button: x=130..200, y=80..120
-  else if (x >= 130 && x <= 200 && y >= 80 && y <= 120) {
+  // OUTDOOR button: x=130..200, y=72..104
+  else if (x >= 130 && x <= 200 && y >= 72 && y <= 104) {
     setAfeMode(AFE_GB_OUTDOOR);
     flashFeedback(BTN_OUTDOOR);
   }
-  // RESET FILTERS button: x=50..190, y=150..190
-  else if (x >= 50 && x <= 190 && y >= 150 && y <= 190) {
+  // TIMEOUT tile: x=40..200, y=118..148 (tap cycles options)
+  else if (x >= 40 && x <= 200 && y >= 118 && y <= 148) {
+    cycleTimeout();
+    flashFeedback(BTN_TIMEOUT);
+  }
+  // RESET FILTERS button: x=50..190, y=162..194
+  else if (x >= 50 && x <= 190 && y >= 162 && y <= 194) {
     resetFilters();
     flashFeedback(BTN_RESET);
   }
@@ -773,6 +852,14 @@ void onTap(int16_t x, int16_t y) {
 void pollTouch() {
   bool isLow = (digitalRead(TOUCH_INT) == LOW);
   if (isLow) {
+    // Any touch counts as user activity — restart inactivity timer
+    // and, if the screen was off, wake it and swallow this press.
+    bool wokeFromOff = !displayOn;
+    markActivity();
+    if (wokeFromOff) {
+      touchPressed = false;
+      return;
+    }
     int16_t rx, ry;
     if (touchReadPoint(rx, ry)) {
       if (!touchPressed) {
@@ -795,7 +882,9 @@ void pollTouch() {
     uint32_t held = millis() - touchDownMs;
     Serial.printf("[touch] up %d,%d dx=%d dy=%d held=%ums\r\n",
                   touchX, touchY, dx, dy, (unsigned)held);
-    if (adx > SWIPE_MIN_PX && adx > ady) {
+    // Swipe: horizontal dominates (adx > ady * 0.7) AND exceeds threshold.
+    // The 0.7 factor means a swipe that's slightly diagonal still counts.
+    if (adx > SWIPE_MIN_PX && adx * 10 > ady * 7) {
       onSwipe();
     } else if (adx < TAP_MAX_PX && ady < TAP_MAX_PX && held < TAP_MAX_MS) {
       onTap(touchX, touchY);
@@ -821,51 +910,63 @@ void drawSettings() {
   spr.setTextDatum(MC_DATUM);
   spr.setTextColor(C_GREY, C_BG);
   spr.setTextSize(1);
-  spr.drawString("AFE MODE", CX, 66);
+  spr.drawString("AFE MODE", CX, 60);
 
   bool flashActive = (flashButton != BTN_NONE && millis() < flashUntilMs);
 
-  // INDOOR / OUTDOOR buttons
+  // INDOOR / OUTDOOR buttons (row 1, y=72..104)
   uint16_t inBorder  = !outdoorMode ? C_GOLD : C_DIM;
   uint16_t outBorder = outdoorMode  ? C_GOLD : C_DIM;
   bool flashIn  = flashActive && flashButton == BTN_INDOOR;
   bool flashOut = flashActive && flashButton == BTN_OUTDOOR;
 
   if (flashIn) {
-    spr.fillRoundRect(40, 80, 70, 40, 5, C_GOLD);
+    spr.fillRoundRect(40, 72, 70, 32, 5, C_GOLD);
     spr.setTextColor(C_BG, C_GOLD);
   } else {
-    spr.drawRoundRect(40, 80, 70, 40, 5, inBorder);
-    if (!outdoorMode) spr.drawRoundRect(41, 81, 68, 38, 4, inBorder);
+    spr.drawRoundRect(40, 72, 70, 32, 5, inBorder);
+    if (!outdoorMode) spr.drawRoundRect(41, 73, 68, 30, 4, inBorder);
     spr.setTextColor(!outdoorMode ? C_GOLD : C_GREY, C_BG);
   }
-  spr.drawString("INDOOR", 75, 100);
+  spr.drawString("INDOOR", 75, 88);
 
   if (flashOut) {
-    spr.fillRoundRect(130, 80, 70, 40, 5, C_GOLD);
+    spr.fillRoundRect(130, 72, 70, 32, 5, C_GOLD);
     spr.setTextColor(C_BG, C_GOLD);
   } else {
-    spr.drawRoundRect(130, 80, 70, 40, 5, outBorder);
-    if (outdoorMode) spr.drawRoundRect(131, 81, 68, 38, 4, outBorder);
+    spr.drawRoundRect(130, 72, 70, 32, 5, outBorder);
+    if (outdoorMode) spr.drawRoundRect(131, 73, 68, 30, 4, outBorder);
     spr.setTextColor(outdoorMode ? C_GOLD : C_GREY, C_BG);
   }
-  spr.drawString("OUTDOOR", 165, 100);
+  spr.drawString("OUTDOOR", 165, 88);
 
-  // RESET FILTERS button
+  // TIMEOUT tile (row 2, y=118..148)
+  bool flashTimeout = flashActive && flashButton == BTN_TIMEOUT;
+  char buf[32];
+  snprintf(buf, sizeof(buf), "TIMEOUT  %s", TIMEOUT_LABELS[timeoutIdx]);
+  if (flashTimeout) {
+    spr.fillRoundRect(40, 118, 160, 30, 5, C_GOLD);
+    spr.setTextColor(C_BG, C_GOLD);
+  } else {
+    spr.drawRoundRect(40, 118, 160, 30, 5, C_DIM);
+    spr.setTextColor(C_GREY, C_BG);
+  }
+  spr.drawString(buf, CX, 133);
+
+  // RESET FILTERS button (row 3, y=162..194)
   bool flashReset = flashActive && flashButton == BTN_RESET;
   if (flashReset) {
-    spr.fillRoundRect(50, 150, 140, 40, 5, C_ORANGE);
+    spr.fillRoundRect(50, 162, 140, 32, 5, C_ORANGE);
     spr.setTextColor(C_BG, C_ORANGE);
-    spr.drawString("RESET!", CX, 170);
+    spr.drawString("RESET!", CX, 178);
   } else {
-    spr.drawRoundRect(50, 150, 140, 40, 5, C_ORANGE);
+    spr.drawRoundRect(50, 162, 140, 32, 5, C_ORANGE);
     spr.setTextColor(C_ORANGE, C_BG);
-    spr.drawString("RESET FILTERS", CX, 170);
+    spr.drawString("RESET FILTERS", CX, 178);
   }
 
   // Status footer
   spr.setTextColor(C_GREY, C_BG);
-  char buf[32];
   snprintf(buf, sizeof(buf), "CAP %u  LCO %lu Hz",
            activeTunCap, (unsigned long)activeLcoHz);
   spr.drawString(buf, CX, 210);
@@ -905,10 +1006,19 @@ void setup() {
       outdoorMode = (savedAfe == AFE_GB_OUTDOOR);
     }
   }
+  if (prefs.isKey(NVS_KEY_TIMEOUT)) {
+    uint8_t t = prefs.getUChar(NVS_KEY_TIMEOUT, TIMEOUT_DEFAULT_IDX);
+    if (t < TIMEOUT_OPTIONS_N) timeoutIdx = t;
+  }
   prefs.end();
 
   // Touch INT pin (CHSC6X controller). Idle-high, pulled low on touch.
   pinMode(TOUCH_INT, INPUT_PULLUP);
+
+  // Backlight pin — keep on during boot.
+  pinMode(TFT_BL_PIN, OUTPUT);
+  setBacklight(true);
+  lastActivityMs = millis();
 
   // Prompt for antenna tune over serial. Longer window on first boot
   // (no saved calibration) because the user should really do this.
@@ -970,40 +1080,44 @@ void loop() {
 
   pollTouch();
 
-  uint8_t intReg;
-  if (!i2cRead(REG_LCO_INT, intReg)) {
-    if (i2cFailStreak >= I2C_FAIL_LIMIT) {
-      Serial.println("[I2C] sensor lost");
-      sensorOk = false;
+  // Tier-1: only talk to the AS3935 when its INT pin has asserted.
+  if (as3935IrqPending) {
+    as3935IrqPending = false;
+    uint8_t intReg;
+    if (!i2cRead(REG_LCO_INT, intReg)) {
+      if (i2cFailStreak >= I2C_FAIL_LIMIT) {
+        Serial.println("[I2C] sensor lost");
+        sensorOk = false;
+      }
+    } else {
+      uint8_t reason = intReg & INT_MASK;
+      if (reason != 0) {
+        lastIrqMs = now;
+        markActivity();
+      }
+      if (reason == INT_NH) {
+        Serial.println("[NH] noise floor too high");
+        raiseNoiseFloor();
+        senseLastAdj = now;
+        nfLastDecay  = now;
+      } else if (reason == INT_D) {
+        Serial.println("[D] disturber");
+        tightenFilters();
+        senseLastAdj = now;
+      } else if (reason == INT_L) {
+        uint32_t e = readEnergy();
+        uint8_t  d = readReg(REG_DISTANCE) & DIST_FIELD_MASK;
+        strikeCount++;
+        lastEnergy   = e;
+        lastDistRaw  = d;
+        lastStrikeMs = now;
+        if (e > maxEnergy) maxEnergy = e;
+        pushTick(e);
+        Serial.printf("strike #%d d=0x%02X e=%lu\r\n",
+                      strikeCount, d, (unsigned long)e);
+        flashScreen();
+      }
     }
-    delay(50);
-    return;
-  }
-
-  uint8_t reason = intReg & INT_MASK;
-  if (reason != 0) lastIrqMs = now;
-
-  if (reason == INT_NH) {
-    Serial.println("[NH] noise floor too high");
-    raiseNoiseFloor();
-    senseLastAdj = now;
-    nfLastDecay  = now;
-  } else if (reason == INT_D) {
-    Serial.println("[D] disturber");
-    tightenFilters();
-    senseLastAdj = now;
-  } else if (reason == INT_L) {
-    uint32_t e = readEnergy();
-    uint8_t  d = readReg(REG_DISTANCE) & DIST_FIELD_MASK;
-    strikeCount++;
-    lastEnergy   = e;
-    lastDistRaw  = d;
-    lastStrikeMs = now;
-    if (e > maxEnergy) maxEnergy = e;
-    pushTick(e);
-    Serial.printf("strike #%d d=0x%02X e=%lu\r\n",
-                  strikeCount, d, (unsigned long)e);
-    flashScreen();
   }
 
   if (now - senseLastAdj > SENSE_EASE_MS) {
@@ -1020,9 +1134,21 @@ void loop() {
     lastIrqMs = now;
   }
 
-  radarAngle += 2.5f;
-  if (radarAngle >= 360) radarAngle -= 360;
+  // Tier-2: turn off the backlight after inactivity. Skip the UI
+  // redraw entirely while dark — biggest CPU + power win.
+  uint32_t timeoutMs = TIMEOUT_OPTIONS_MS[timeoutIdx];
+  bool keepOn = noiseFault;   // keep the "env too noisy" warning visible
+  if (displayOn && timeoutMs > 0 && !keepOn &&
+      (now - lastActivityMs) > timeoutMs) {
+    Serial.printf("[blank] idle %lus — backlight off\r\n",
+                  (unsigned long)((now - lastActivityMs) / 1000));
+    setBacklight(false);
+  }
 
-  drawUI();
-  delay(50);
+  if (displayOn) {
+    radarAngle += 2.5f;
+    if (radarAngle >= 360) radarAngle -= 360;
+    drawUI();
+  }
+  delay(20);
 }
