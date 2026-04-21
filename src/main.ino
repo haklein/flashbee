@@ -129,18 +129,24 @@ TFT_eSprite spr = TFT_eSprite(&tft);
 #define NVS_KEY_AFE         "afe"
 #define NVS_KEY_TIMEOUT     "tmout"
 
-// Display backlight pin (GC9A01 via Setup501 puts this on D6).
-// Round Display v1.1 routes the backlight MOSFET through a 2-bit
-// DIP switch selecting A0 / D6 (Seeed changelog 2023-04-07). We
-// drive BOTH pins in sync so the firmware works regardless of how
-// the switches are set. A0/D6 aren't used by anything else in this
-// project, so there's no conflict.
+// Round Display v1.1 KE switch (per Seeed wiki):
+//   KE switch ON  → A0 connects to the battery voltage divider and
+//                   D6 connects to the backlight MOSFET.
+//   KE switch OFF → A0 and D6 are released as plain XIAO GPIOs.
+// We drive D6 for backlight. With KE on the LED follows; with KE
+// off the write is a no-op. A0 is only ever read as analog in.
 #ifndef TFT_BL_PIN
   #define TFT_BL_PIN        D6
 #endif
-#ifndef TFT_BL_PIN_ALT
-  #define TFT_BL_PIN_ALT    A0
+#ifndef BAT_ADC_PIN
+  #define BAT_ADC_PIN       A0
 #endif
+// Battery divider on Round Display v1.1 is R28/R29 (470K each),
+// so the ADC tap sees VBAT/2. Multiply back up.
+#define BAT_DIVIDER_NUM   2
+#define BAT_READ_MS       2000UL   // refresh cadence
+#define BAT_PLAUSIBLE_LO  2500     // mV; below this = no battery / KE off
+#define BAT_PLAUSIBLE_HI  4400     // mV; above this = wrong pin / KE off
 
 // Inactivity-timeout options for the settings UI. 0 == NEVER.
 static const uint32_t TIMEOUT_OPTIONS_MS[] = {
@@ -220,6 +226,10 @@ void IRAM_ATTR as3935IrqHandler() { as3935IrqPending = true; }
 bool     displayOn     = true;
 uint32_t lastActivityMs = 0;
 uint8_t  timeoutIdx    = TIMEOUT_DEFAULT_IDX;
+
+// Battery sense state.
+uint16_t batteryMv       = 0;        // 0 == not yet read / implausible
+uint32_t batteryLastMs   = 0;
 
 Preferences prefs;
 
@@ -739,27 +749,38 @@ bool pollForTuneCmd(uint32_t windowMs) {
   return false;
 }
 
-// ── Tier-2 backlight + inactivity ──────────────────────────────
-// Some Seeed Round Display revisions have the backlight hardwired
-// on — toggling D6 has no effect. Also drive the GC9A01 controller
-// into SLPIN/DISPOFF so the pixels actually go dark regardless of
-// whether the backlight pin is wired through.
+// ── Battery sense ──────────────────────────────────────────────
+void updateBattery() {
+  uint32_t now = millis();
+  if (now - batteryLastMs < BAT_READ_MS && batteryLastMs != 0) return;
+  batteryLastMs = now;
+  uint32_t sum = 0;
+  const int N = 8;
+  for (int i = 0; i < N; i++) sum += analogReadMilliVolts(BAT_ADC_PIN);
+  uint16_t tap = (uint16_t)(sum / N);
+  uint16_t v   = tap * BAT_DIVIDER_NUM;
+  // Range-check so a floating A0 (KE switch off, no divider) doesn't
+  // show a ghost reading. Store 0 when implausible.
+  batteryMv = (v >= BAT_PLAUSIBLE_LO && v <= BAT_PLAUSIBLE_HI) ? v : 0;
+}
+
+// ── Tier-2 backlight + panel sleep ─────────────────────────────
+// Driving D6 cuts the backlight when the Round Display v1.1 KE
+// switch is in the ON position. The GC9A01 controller is also
+// put into DISPOFF + SLPIN so pixel output stops even if the KE
+// switch is OFF (user will still see a dark/black screen, just
+// with the LED still lit).
 void setBacklight(bool on) {
-  pinMode(TFT_BL_PIN,     OUTPUT);
-  pinMode(TFT_BL_PIN_ALT, OUTPUT);
+  pinMode(TFT_BL_PIN, OUTPUT);
   if (on) {
-    // Wake panel first, then light.
     tft.writecommand(0x11);   // SLPOUT
     delay(5);
     tft.writecommand(0x29);   // DISPON
-    digitalWrite(TFT_BL_PIN,     HIGH);
-    digitalWrite(TFT_BL_PIN_ALT, HIGH);
+    digitalWrite(TFT_BL_PIN, HIGH);
   } else {
-    // Light off first, then blank + sleep the panel.
-    digitalWrite(TFT_BL_PIN,     LOW);
-    digitalWrite(TFT_BL_PIN_ALT, LOW);
-    tft.writecommand(0x28);   // DISPOFF — outputs forced black
-    tft.writecommand(0x10);   // SLPIN   — internal timing gated
+    digitalWrite(TFT_BL_PIN, LOW);
+    tft.writecommand(0x28);   // DISPOFF
+    tft.writecommand(0x10);   // SLPIN
   }
   displayOn = on;
   Serial.printf("[bl] %s\r\n", on ? "on" : "off");
@@ -995,8 +1016,13 @@ void drawSettings() {
 
   // Status footer
   spr.setTextColor(C_GREY, C_BG);
-  snprintf(buf, sizeof(buf), "CAP %u  LCO %lu Hz",
-           activeTunCap, (unsigned long)activeLcoHz);
+  if (batteryMv > 0) {
+    snprintf(buf, sizeof(buf), "CAP %u  BAT %u.%02u V",
+             activeTunCap,
+             batteryMv / 1000, (batteryMv % 1000) / 10);
+  } else {
+    snprintf(buf, sizeof(buf), "CAP %u  BAT --", activeTunCap);
+  }
   spr.drawString(buf, CX, 210);
   snprintf(buf, sizeof(buf), "NF %u  WD %u  SR %u",
            noiseFloor, watchdogLvl, spikeRej);
@@ -1043,10 +1069,8 @@ void setup() {
   // Touch INT pin (CHSC6X controller). Idle-high, pulled low on touch.
   pinMode(TOUCH_INT, INPUT_PULLUP);
 
-  // Backlight pins — keep on during boot. Drive both A0 and D6 so
-  // the Round Display v1.1 DIP switches can be in any combination.
-  pinMode(TFT_BL_PIN,     OUTPUT);
-  pinMode(TFT_BL_PIN_ALT, OUTPUT);
+  // Backlight pin as output + panel awake.
+  pinMode(TFT_BL_PIN, OUTPUT);
   setBacklight(true);
   lastActivityMs = millis();
 
@@ -1109,6 +1133,7 @@ void loop() {
   }
 
   pollTouch();
+  updateBattery();
 
   // Tier-1: only talk to the AS3935 when its INT pin has asserted.
   if (as3935IrqPending) {
@@ -1170,7 +1195,7 @@ void loop() {
   bool keepOn = noiseFault;   // keep the "env too noisy" warning visible
   if (displayOn && timeoutMs > 0 && !keepOn &&
       (now - lastActivityMs) > timeoutMs) {
-    Serial.printf("[blank] idle %lus — backlight off\r\n",
+    Serial.printf("[blank] idle %lus — panel sleep\r\n",
                   (unsigned long)((now - lastActivityMs) / 1000));
     setBacklight(false);
   }
