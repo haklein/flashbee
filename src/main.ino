@@ -7,6 +7,8 @@
 #include <TFT_eSPI.h>
 #include <math.h>
 #include <Preferences.h>
+#include <esp_sleep.h>
+#include <driver/gpio.h>
 
 // ── Display ─────────────────────────────────────────────────────
 TFT_eSPI    tft = TFT_eSPI();
@@ -128,6 +130,7 @@ TFT_eSprite spr = TFT_eSprite(&tft);
 #define NVS_KEY_TUNHZ       "tunhz"
 #define NVS_KEY_AFE         "afe"
 #define NVS_KEY_TIMEOUT     "tmout"
+#define NVS_KEY_SLEEP       "sleep"
 
 // Round Display v1.1 KE switch (per Seeed wiki):
 //   KE switch ON  → A0 connects to the battery voltage divider and
@@ -157,6 +160,18 @@ static const char* const TIMEOUT_LABELS[] = {
 };
 #define TIMEOUT_OPTIONS_N   6
 #define TIMEOUT_DEFAULT_IDX 2   // 2 min
+
+// Deep-idle -> light sleep options. 0 == NEVER. Light sleep wakes
+// on AS3935 INT rising (strike/disturber/NH) or on a touch. Serial
+// (USB-CDC) disconnects while sleeping; it re-enumerates on wake.
+static const uint32_t SLEEP_OPTIONS_MS[] = {
+  300000UL, 900000UL, 1800000UL, 3600000UL, 7200000UL, 0UL
+};
+static const char* const SLEEP_LABELS[] = {
+  "5 min", "15 min", "30 min", "1 h", "2 h", "NEVER"
+};
+#define SLEEP_OPTIONS_N     6
+#define SLEEP_DEFAULT_IDX   2   // 30 min
 
 // Touch controller (CHSC6X) shares Wire with the AS3935. Different
 // address (0x2E vs 0x03), so no bus conflict.
@@ -210,7 +225,8 @@ enum ButtonId : int8_t {
   BTN_INDOOR  = 0,
   BTN_OUTDOOR = 1,
   BTN_TIMEOUT = 2,
-  BTN_RESET   = 3,
+  BTN_SLEEP   = 3,
+  BTN_RESET   = 4,
 };
 ButtonId flashButton    = BTN_NONE;
 uint32_t flashUntilMs   = 0;
@@ -226,6 +242,7 @@ void IRAM_ATTR as3935IrqHandler() { as3935IrqPending = true; }
 bool     displayOn     = true;
 uint32_t lastActivityMs = 0;
 uint8_t  timeoutIdx    = TIMEOUT_DEFAULT_IDX;
+uint8_t  sleepIdx      = SLEEP_DEFAULT_IDX;
 
 // Battery sense state.
 uint16_t batteryMv       = 0;        // 0 == not yet read / implausible
@@ -831,6 +848,65 @@ void cycleTimeout() {
   markActivity();  // start the new timer fresh
 }
 
+void setSleepIdx(uint8_t idx) {
+  if (idx >= SLEEP_OPTIONS_N) idx = 0;
+  sleepIdx = idx;
+  prefs.begin(NVS_NAMESPACE, false);
+  prefs.putUChar(NVS_KEY_SLEEP, sleepIdx);
+  prefs.end();
+  Serial.printf("[sleep-cfg] -> %s\r\n", SLEEP_LABELS[sleepIdx]);
+}
+
+void cycleSleep() {
+  setSleepIdx((sleepIdx + 1) % SLEEP_OPTIONS_N);
+  markActivity();
+}
+
+// ── Tier-3 light sleep ─────────────────────────────────────────
+// Entered when backlight is already off AND deep-idle timeout
+// elapsed. Wake sources: AS3935 INT high level, touch low level.
+// A safety timer wakes us at most once/hour even if both GPIO
+// sources fail, so the firmware can't get permanently stuck.
+void enterLightSleep() {
+  // 1. If there's a latched AS3935 INT, level-wake would fire
+  //    immediately. Clear it first; if the read fails, bail out
+  //    and try again on the next loop tick.
+  if (sensorOk) {
+    uint8_t tmp;
+    if (!i2cRead(REG_LCO_INT, tmp)) {
+      Serial.println("[sleep] abort: could not clear AS3935 INT");
+      return;
+    }
+  }
+  if (digitalRead(AS3935_INT_PIN) == HIGH) {
+    Serial.println("[sleep] abort: AS3935 INT still high after clear");
+    as3935IrqPending = true;
+    return;
+  }
+
+  Serial.println("[sleep] entering light sleep");
+  Serial.flush();
+
+  // Wake sources — ESP-IDF 5.x API.
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+  gpio_wakeup_enable((gpio_num_t)AS3935_INT_PIN, GPIO_INTR_HIGH_LEVEL);
+  gpio_wakeup_enable((gpio_num_t)TOUCH_INT,      GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+  // 1-hour safety timer. Even if both GPIOs misbehave we resume
+  // periodically for the sensor-watchdog re-init path.
+  esp_sleep_enable_timer_wakeup((uint64_t)3600ULL * 1000ULL * 1000ULL);
+
+  esp_light_sleep_start();   // blocks until wake event
+
+  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  Serial.printf("[sleep] woke cause=%d\r\n", (int)cause);
+
+  markActivity();            // reset timers, re-enable backlight
+  // If the AS3935 fired, the ISR may or may not have caught the
+  // edge while sleeping; force a poll either way.
+  if (digitalRead(AS3935_INT_PIN) == HIGH) as3935IrqPending = true;
+}
+
 void setAfeMode(uint8_t gbValue) {
   // Clamp to the two datasheet values; anything else is ignored.
   if (gbValue != AFE_GB_INDOOR && gbValue != AFE_GB_OUTDOOR) return;
@@ -899,23 +975,28 @@ void flashFeedback(ButtonId which) {
 void onTap(int16_t x, int16_t y) {
   Serial.printf("[touch] tap %d,%d screen=%u\r\n", x, y, (unsigned)currentScreen);
   if (currentScreen != SCREEN_SETTINGS) return;
-  // INDOOR button: x=40..110, y=72..104
-  if (x >= 40 && x <= 110 && y >= 72 && y <= 104) {
+  // INDOOR:  x[40..110]  y[38..66]
+  if (x >= 40 && x <= 110 && y >= 38 && y <= 66) {
     setAfeMode(AFE_GB_INDOOR);
     flashFeedback(BTN_INDOOR);
   }
-  // OUTDOOR button: x=130..200, y=72..104
-  else if (x >= 130 && x <= 200 && y >= 72 && y <= 104) {
+  // OUTDOOR: x[130..200] y[38..66]
+  else if (x >= 130 && x <= 200 && y >= 38 && y <= 66) {
     setAfeMode(AFE_GB_OUTDOOR);
     flashFeedback(BTN_OUTDOOR);
   }
-  // TIMEOUT tile: x=40..200, y=118..148 (tap cycles options)
-  else if (x >= 40 && x <= 200 && y >= 118 && y <= 148) {
+  // TIMEOUT tile: x[40..200] y[74..98]
+  else if (x >= 40 && x <= 200 && y >= 74 && y <= 98) {
     cycleTimeout();
     flashFeedback(BTN_TIMEOUT);
   }
-  // RESET FILTERS button: x=50..190, y=162..194
-  else if (x >= 50 && x <= 190 && y >= 162 && y <= 194) {
+  // SLEEP tile: x[40..200] y[104..128]
+  else if (x >= 40 && x <= 200 && y >= 104 && y <= 128) {
+    cycleSleep();
+    flashFeedback(BTN_SLEEP);
+  }
+  // RESET FILTERS: x[50..190] y[138..168]
+  else if (x >= 50 && x <= 190 && y >= 138 && y <= 168) {
     resetFilters();
     flashFeedback(BTN_RESET);
   }
@@ -973,68 +1054,76 @@ void drawSettings() {
   spr.setTextDatum(TC_DATUM);
   spr.setTextColor(C_GOLD, C_BG);
   spr.setTextSize(2);
-  spr.drawString("SETTINGS", CX, 14);
-  spr.setTextSize(1);
-  spr.setTextColor(C_GREY, C_BG);
-  spr.drawString("swipe to return", CX, 36);
+  spr.drawString("SETTINGS", CX, 10);
 
-  // AFE mode header
   spr.setTextDatum(MC_DATUM);
   spr.setTextColor(C_GREY, C_BG);
   spr.setTextSize(1);
-  spr.drawString("AFE MODE", CX, 60);
+  spr.drawString("AFE MODE", CX, 30);
 
   bool flashActive = (flashButton != BTN_NONE && millis() < flashUntilMs);
+  char buf[40];
 
-  // INDOOR / OUTDOOR buttons (row 1, y=72..104)
+  // INDOOR / OUTDOOR (row 1, y=38..66)
   uint16_t inBorder  = !outdoorMode ? C_GOLD : C_DIM;
   uint16_t outBorder = outdoorMode  ? C_GOLD : C_DIM;
   bool flashIn  = flashActive && flashButton == BTN_INDOOR;
   bool flashOut = flashActive && flashButton == BTN_OUTDOOR;
 
   if (flashIn) {
-    spr.fillRoundRect(40, 72, 70, 32, 5, C_GOLD);
+    spr.fillRoundRect(40, 38, 70, 28, 5, C_GOLD);
     spr.setTextColor(C_BG, C_GOLD);
   } else {
-    spr.drawRoundRect(40, 72, 70, 32, 5, inBorder);
-    if (!outdoorMode) spr.drawRoundRect(41, 73, 68, 30, 4, inBorder);
+    spr.drawRoundRect(40, 38, 70, 28, 5, inBorder);
+    if (!outdoorMode) spr.drawRoundRect(41, 39, 68, 26, 4, inBorder);
     spr.setTextColor(!outdoorMode ? C_GOLD : C_GREY, C_BG);
   }
-  spr.drawString("INDOOR", 75, 88);
+  spr.drawString("INDOOR", 75, 52);
 
   if (flashOut) {
-    spr.fillRoundRect(130, 72, 70, 32, 5, C_GOLD);
+    spr.fillRoundRect(130, 38, 70, 28, 5, C_GOLD);
     spr.setTextColor(C_BG, C_GOLD);
   } else {
-    spr.drawRoundRect(130, 72, 70, 32, 5, outBorder);
-    if (outdoorMode) spr.drawRoundRect(131, 73, 68, 30, 4, outBorder);
+    spr.drawRoundRect(130, 38, 70, 28, 5, outBorder);
+    if (outdoorMode) spr.drawRoundRect(131, 39, 68, 26, 4, outBorder);
     spr.setTextColor(outdoorMode ? C_GOLD : C_GREY, C_BG);
   }
-  spr.drawString("OUTDOOR", 165, 88);
+  spr.drawString("OUTDOOR", 165, 52);
 
-  // TIMEOUT tile (row 2, y=118..148)
+  // TIMEOUT tile (row 2, y=74..98)
   bool flashTimeout = flashActive && flashButton == BTN_TIMEOUT;
-  char buf[32];
-  snprintf(buf, sizeof(buf), "TIMEOUT  %s", TIMEOUT_LABELS[timeoutIdx]);
+  snprintf(buf, sizeof(buf), "SCREEN  %s", TIMEOUT_LABELS[timeoutIdx]);
   if (flashTimeout) {
-    spr.fillRoundRect(40, 118, 160, 30, 5, C_GOLD);
+    spr.fillRoundRect(40, 74, 160, 24, 4, C_GOLD);
     spr.setTextColor(C_BG, C_GOLD);
   } else {
-    spr.drawRoundRect(40, 118, 160, 30, 5, C_DIM);
+    spr.drawRoundRect(40, 74, 160, 24, 4, C_DIM);
     spr.setTextColor(C_GREY, C_BG);
   }
-  spr.drawString(buf, CX, 133);
+  spr.drawString(buf, CX, 86);
 
-  // RESET FILTERS button (row 3, y=162..194)
+  // SLEEP tile (row 3, y=104..128)
+  bool flashSleep = flashActive && flashButton == BTN_SLEEP;
+  snprintf(buf, sizeof(buf), "SLEEP   %s", SLEEP_LABELS[sleepIdx]);
+  if (flashSleep) {
+    spr.fillRoundRect(40, 104, 160, 24, 4, C_GOLD);
+    spr.setTextColor(C_BG, C_GOLD);
+  } else {
+    spr.drawRoundRect(40, 104, 160, 24, 4, C_DIM);
+    spr.setTextColor(C_GREY, C_BG);
+  }
+  spr.drawString(buf, CX, 116);
+
+  // RESET FILTERS (row 4, y=138..168)
   bool flashReset = flashActive && flashButton == BTN_RESET;
   if (flashReset) {
-    spr.fillRoundRect(50, 162, 140, 32, 5, C_ORANGE);
+    spr.fillRoundRect(50, 138, 140, 30, 5, C_ORANGE);
     spr.setTextColor(C_BG, C_ORANGE);
-    spr.drawString("RESET!", CX, 178);
+    spr.drawString("RESET!", CX, 153);
   } else {
-    spr.drawRoundRect(50, 162, 140, 32, 5, C_ORANGE);
+    spr.drawRoundRect(50, 138, 140, 30, 5, C_ORANGE);
     spr.setTextColor(C_ORANGE, C_BG);
-    spr.drawString("RESET FILTERS", CX, 178);
+    spr.drawString("RESET FILTERS", CX, 153);
   }
 
   // Status footer
@@ -1046,10 +1135,10 @@ void drawSettings() {
   } else {
     snprintf(buf, sizeof(buf), "BAT --");
   }
-  spr.drawString(buf, CX, 210);
+  spr.drawString(buf, CX, 186);
   snprintf(buf, sizeof(buf), "NF %u  WD %u  SR %u",
            noiseFloor, watchdogLvl, spikeRej);
-  spr.drawString(buf, CX, 222);
+  spr.drawString(buf, CX, 200);
 
   spr.pushSprite(0, 0);
 }
@@ -1086,6 +1175,10 @@ void setup() {
   if (prefs.isKey(NVS_KEY_TIMEOUT)) {
     uint8_t t = prefs.getUChar(NVS_KEY_TIMEOUT, TIMEOUT_DEFAULT_IDX);
     if (t < TIMEOUT_OPTIONS_N) timeoutIdx = t;
+  }
+  if (prefs.isKey(NVS_KEY_SLEEP)) {
+    uint8_t s = prefs.getUChar(NVS_KEY_SLEEP, SLEEP_DEFAULT_IDX);
+    if (s < SLEEP_OPTIONS_N) sleepIdx = s;
   }
   prefs.end();
 
@@ -1233,6 +1326,15 @@ void loop() {
     Serial.printf("[blank] idle %lus — panel sleep\r\n",
                   (unsigned long)((now - lastActivityMs) / 1000));
     setBacklight(false);
+  }
+
+  // Tier-3: after the longer deep-idle window, light-sleep the CPU.
+  // Only entered when the screen is already off and nothing in the
+  // recent past looks fault-ish.
+  uint32_t sleepMs = SLEEP_OPTIONS_MS[sleepIdx];
+  if (!displayOn && !keepOn && sensorOk &&
+      sleepMs > 0 && (now - lastActivityMs) > sleepMs) {
+    enterLightSleep();
   }
 
   if (displayOn) {
