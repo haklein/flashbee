@@ -1018,6 +1018,7 @@ void pollTouch() {
     bool wokeFromOff = !displayOn;
     markActivity();
     if (wokeFromOff) {
+      Serial.println("[wake] touch");
       touchPressed = false;
       return;
     }
@@ -1335,10 +1336,14 @@ void loop() {
   // redraw entirely while dark — biggest CPU + power win.
   uint32_t timeoutMs = TIMEOUT_OPTIONS_MS[timeoutIdx];
   bool keepOn = noiseFault;   // keep the "env too noisy" warning visible
+  // Signed comparison below: pollTouch()/onEvent may have updated
+  // lastActivityMs to a value slightly *later* than the `now` we
+  // cached at the top of loop(), making (now - lastActivityMs)
+  // underflow to ~4.29e9 ms and fire an immediate spurious blank.
+  int32_t idleMs = (int32_t)(now - lastActivityMs);
   if (displayOn && timeoutMs > 0 && !keepOn &&
-      (now - lastActivityMs) > timeoutMs) {
-    Serial.printf("[blank] idle %lus — panel sleep\r\n",
-                  (unsigned long)((now - lastActivityMs) / 1000));
+      idleMs > (int32_t)timeoutMs) {
+    Serial.printf("[blank] idle %ds — panel sleep\r\n", idleMs / 1000);
     setBacklight(false);
   }
 
@@ -1348,7 +1353,7 @@ void loop() {
 #if ENABLE_LIGHT_SLEEP
   uint32_t sleepMs = SLEEP_OPTIONS_MS[sleepIdx];
   if (!displayOn && !keepOn && sensorOk &&
-      sleepMs > 0 && (now - lastActivityMs) > sleepMs) {
+      sleepMs > 0 && idleMs > (int32_t)sleepMs) {
     enterLightSleep();
   }
 #endif
