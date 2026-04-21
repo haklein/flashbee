@@ -900,6 +900,28 @@ void enterLightSleep() {
                 digitalRead(AS3935_INT_PIN), digitalRead(TOUCH_INT));
   Serial.flush();
 
+  // Explicit ESP-IDF gpio_config before arming wake — Arduino's
+  // pinMode(INPUT_PULLUP) programs the pull-up via the GPIO matrix
+  // but light-sleep wake on ESP32-C6 reads the pad level via the
+  // LP/HP GPIO peripheral; the pull-up state has to be set through
+  // gpio_config() for that path to see it.
+  gpio_config_t touch_cfg = {
+    .pin_bit_mask = BIT64(TOUCH_INT),
+    .mode         = GPIO_MODE_INPUT,
+    .pull_up_en   = GPIO_PULLUP_ENABLE,
+    .pull_down_en = GPIO_PULLDOWN_DISABLE,
+    .intr_type    = GPIO_INTR_DISABLE,
+  };
+  gpio_config(&touch_cfg);
+  gpio_config_t as3935_cfg = {
+    .pin_bit_mask = BIT64(AS3935_INT_PIN),
+    .mode         = GPIO_MODE_INPUT,
+    .pull_up_en   = GPIO_PULLUP_DISABLE,
+    .pull_down_en = GPIO_PULLDOWN_DISABLE,
+    .intr_type    = GPIO_INTR_DISABLE,
+  };
+  gpio_config(&as3935_cfg);
+
   // Wake sources — ESP-IDF 5.x API.
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
   esp_err_t e1 = gpio_wakeup_enable((gpio_num_t)AS3935_INT_PIN, GPIO_INTR_HIGH_LEVEL);
@@ -921,6 +943,12 @@ void enterLightSleep() {
   bool fromTouch  = (digitalRead(TOUCH_INT)      == LOW);
   Serial.printf("[sleep] woke cause=%d as3935=%d touch=%d after %lums\r\n",
                 (int)cause, fromAs3935, fromTouch, (unsigned long)slept);
+
+  // Our pre-sleep gpio_config disabled the regular GPIO interrupts
+  // on AS3935_INT_PIN. Re-attach so post-wake strike events still
+  // fire the ISR path.
+  attachInterrupt(digitalPinToInterrupt(AS3935_INT_PIN),
+                  as3935IrqHandler, RISING);
 
   // Only touch unconditionally wakes the display. An AS3935 event
   // gets deferred to the main loop — if it's a strike the handler
