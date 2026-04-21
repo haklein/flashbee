@@ -984,6 +984,7 @@ bool touchReadPoint(int16_t &x, int16_t &y) {
 
 void onSwipe() {
   currentScreen = (currentScreen == SCREEN_MAIN) ? SCREEN_SETTINGS : SCREEN_MAIN;
+  Serial.printf("[touch] swipe -> screen=%u\r\n", (unsigned)currentScreen);
 }
 
 void flashFeedback(ButtonId which) {
@@ -1055,12 +1056,14 @@ void pollTouch() {
     uint32_t held = millis() - touchDownMs;
     Serial.printf("[touch] up %d,%d dx=%d dy=%d held=%ums\r\n",
                   touchX, touchY, dx, dy, (unsigned)held);
-    // Swipe: horizontal dominates (adx > ady * 0.7) AND exceeds threshold.
-    // The 0.7 factor means a swipe that's slightly diagonal still counts.
-    if (adx > SWIPE_MIN_PX && adx * 10 > ady * 7) {
-      onSwipe();
-    } else if (adx < TAP_MAX_PX && ady < TAP_MAX_PX && held < TAP_MAX_MS) {
+    // Tap: both deltas under threshold and released quickly.
+    // Swipe: anything else where horizontal motion dominates. No
+    // dead zone between the two — short intentional flicks used to
+    // fall in a gap (|dx| 16..24) and get silently dropped.
+    if (adx <= TAP_MAX_PX && ady <= TAP_MAX_PX && held < TAP_MAX_MS) {
       onTap(touchX, touchY);
+    } else if (adx > ady) {
+      onSwipe();
     }
     touchPressed = false;
   }
