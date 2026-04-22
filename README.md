@@ -287,20 +287,46 @@ is kept intact at `7707720` so the deltas are traceable. Fix commit
 - Reg `0x02` writes now preserve `CL_STAT_EN` / `CL_STAT` in
   bits [7:6]; the original blind full-byte write clobbered them.
 
-### What has *not* been validated
+### Hardware validation status
 
-All of the above are datasheet-correctness fixes — none have been
-run against a real Grove AS3935 on hardware yet. In particular:
+All of the above datasheet-correctness fixes have been bench-tested
+on a real XIAO ESP32-C6 + Seeed Round Display v1.1 + Grove AS3935
+module. What works on real silicon:
 
-1. The built-in antenna tune has been compile-tested but not run
-   against a real module. Expect one round of edge-count scaling
-   corrections the first time it runs on hardware (e.g. `attachInterrupt`
-   overhead at 3.9 kHz, glitch filtering on the INT line).
+- AS3935 responds to I²C at `0x03`, `PRESET_DEFAULT` + `CALIB_RCO`
+  complete successfully, TRCO/SRCO done-bits verify clean.
+- Antenna auto-tune sweep runs end-to-end and picks a valid
+  `TUN_CAP` within the ±3.5 % tolerance window. One tested module
+  landed at `TUN_CAP=9 @ 3900 Hz` (0.15 % off target) — the
+  datasheet factory default of `TUN_CAP=0` would have been 2.8 %
+  off, which is why the sweep matters.
+- Interrupt-driven event handling catches `INT_L`, `INT_D`, and
+  `INT_NH` with no missed events under normal load.
+- I²C fault-streak detection trips `SENSOR LOST` after 8
+  consecutive failures; re-init retry at 3 s cadence recovers.
+- Touch + swipe gesture classification, NVS persistence of AFE
+  mode / tune cap / timeouts, backlight off at inactivity, and
+  light-sleep wake on touch or AS3935 INT have all been exercised.
+
+What is still open:
+
+1. **No real CG strike observed yet.** All live data so far is
+   indoor EMI (pellet heater ignition, PV inverter, LED drivers,
+   etc.), which the AS3935 classifies as a mix of disturbers and
+   "close strikes" with `d = 0x01` (overhead). This is expected
+   indoor behaviour per the datasheet — the sensor is designed
+   for outdoor open-air operation. The device needs a real
+   thunderstorm before the distance readout can be cross-checked
+   against [Blitzortung](https://www.blitzortung.org/).
 2. The reviewer critique stands that a single-antenna detector
    produces **statistical** distance to the *head of the storm*,
    not range to the individual strike that triggered the IRQ.
    Do not treat the displayed number as a ranging result you
-   would stake a decision on.
+   would stake a decision on. The `!! SHELTER !!` overlay is the
+   trustworthy output; the km number underneath is a best-effort
+   estimate.
+3. Battery runtime estimates in the Power management section are
+   calculated, not yet measured against the real 10440 cell.
 
 ## License
 
