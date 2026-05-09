@@ -315,6 +315,14 @@ void pushTick(uint32_t e) {
 // ── Filter adjustments ─────────────────────────────────────────
 // Datasheet §8.4: higher WDTH/SREJ = more disturber rejection =
 // LOWER detection efficiency. The names below reflect that trade.
+//
+// Floor for the auto-loosener and noise-floor decay. The init defaults
+// (NF=2, WD=2, SR=2) are the AS3935 datasheet's recommended starting
+// point; values below them give nothing useful in practice — observed
+// during a real storm the chip stopped reporting any events at all
+// when the loosener walked WD/SR/NF all the way to 0/0/0.
+#define FILTER_FLOOR        2
+#define NOISE_FLOOR_FLOOR   2
 void applyWatchdogSpike() {
   maskWrite(REG_NF_WDG, WDTH_MASK, watchdogLvl & WDTH_MASK);
   maskWrite(REG_CLSTAT_SREJ, SREJ_MASK, spikeRej & SREJ_MASK);
@@ -325,8 +333,8 @@ void tightenFilters() {
   applyWatchdogSpike();
 }
 void loosenFilters() {
-  if (spikeRej > watchdogLvl) { if (spikeRej > 0) spikeRej--; }
-  else                        { if (watchdogLvl > 0) watchdogLvl--; }
+  if (spikeRej > watchdogLvl) { if (spikeRej > FILTER_FLOOR) spikeRej--; }
+  else                        { if (watchdogLvl > FILTER_FLOOR) watchdogLvl--; }
   applyWatchdogSpike();
 }
 void raiseNoiseFloor() {
@@ -341,7 +349,7 @@ void raiseNoiseFloor() {
   }
 }
 void lowerNoiseFloor() {
-  if (noiseFloor > 0) {
+  if (noiseFloor > NOISE_FLOOR_FLOOR) {
     noiseFloor--;
     maskWrite(REG_NF_WDG, NF_MASK, (noiseFloor << 4) & NF_MASK);
   }
@@ -391,8 +399,14 @@ bool initAS3935() {
                  MIN_NUM_LIGH_MASK | SREJ_MASK,
                  (0 << 4) | (spikeRej & SREJ_MASK))) return false;
 
-  // 7. Unmask disturbers so the tuner can see them.
-  if (!maskWrite(REG_LCO_INT, MASK_DIST_BIT, 0)) return false;
+  // 7. Mask disturbers in normal operation. Datasheet §8.5: the chip
+  // already rejects disturbers internally; INT_D is purely informational.
+  // Acting on every INT_D (tightenFilters) ratchets WD/SR to deafness
+  // in seconds during a real storm, so the second strike never gets
+  // through. Disturbers are NOT used by the antenna tuner either —
+  // tuning routes LCO to IRQ via DISP_LCO (REG_TUN_CAP bit 7), which
+  // is independent of MASK_DIST.
+  if (!maskWrite(REG_LCO_INT, MASK_DIST_BIT, MASK_DIST_BIT)) return false;
 
   // 8. Hook the hardware IRQ line. Order matters:
   //    (a) clear any latched event so INT isn't currently high;
@@ -816,6 +830,80 @@ bool pollForTuneCmd(uint32_t windowMs) {
     delay(5);
   }
   return false;
+}
+
+// Non-destructive INT-pin / chip health check. Routes LCO to the IRQ
+// pin for one tune-window worth of edge-counting and prints the Hz.
+// Does NOT touch NVS — handy for diagnosing "is the chip / INT wire
+// alive?" mid-session without overwriting saved TUN_CAP.
+void runIntPinCheck() {
+  Serial.println(F("\n=== INT pin check ==="));
+  detachInterrupt(digitalPinToInterrupt(AS3935_INT_PIN));
+
+  bool ok = enableLcoOut();
+  uint32_t hz = 0; uint32_t n = 0;
+  if (!ok) {
+    Serial.println(F("[checkint] enableLcoOut failed (I2C)"));
+  } else {
+    pinMode(AS3935_INT_PIN, INPUT);
+    attachInterrupt(digitalPinToInterrupt(AS3935_INT_PIN), lcoISR, RISING);
+    delay(TUNE_SETTLE_MS);
+    noInterrupts(); lcoEdgeCount = 0; interrupts();
+    delay(TUNE_WINDOW_MS);
+    noInterrupts(); n = lcoEdgeCount; interrupts();
+    detachInterrupt(digitalPinToInterrupt(AS3935_INT_PIN));
+    hz = (uint32_t)((uint64_t)n * 1000UL / TUNE_WINDOW_MS);
+    Serial.printf("[checkint] %lu edges in %u ms = %lu Hz (expected ~%lu)\r\n",
+                  (unsigned long)n, (unsigned)TUNE_WINDOW_MS,
+                  (unsigned long)hz, (unsigned long)LCO_EXPECTED_HZ);
+    if (n == 0) {
+      Serial.println(F("[checkint] NO EDGES — INT wire to MCU likely broken,"));
+      Serial.println(F("           or AS3935 not driving INT (chip wedged)."));
+    } else if (hz < LCO_EXPECTED_HZ - LCO_TOL_HZ ||
+               hz > LCO_EXPECTED_HZ + LCO_TOL_HZ) {
+      Serial.println(F("[checkint] edges present but off-frequency — antenna"));
+      Serial.println(F("           tune may have drifted, but INT path is good."));
+    } else {
+      Serial.println(F("[checkint] INT path good, antenna in tune."));
+    }
+    disableLcoOut();
+  }
+
+  // Restore REG_LCO_INT: LCO_FDIV back to default (00), MASK_DIST=1
+  // for normal operation. Then drain any latched INT bits.
+  maskWrite(REG_LCO_INT, 0xC0, 0x00);
+  maskWrite(REG_LCO_INT, MASK_DIST_BIT, MASK_DIST_BIT);
+  uint8_t discard; i2cRead(REG_LCO_INT, discard);
+
+  attachInterrupt(digitalPinToInterrupt(AS3935_INT_PIN),
+                  as3935IrqHandler, RISING);
+  as3935IrqPending = (digitalRead(AS3935_INT_PIN) == HIGH);
+  Serial.println(F("[checkint] resumed normal operation"));
+}
+
+// Read accumulated chars from Serial and dispatch when we see a newline.
+// Currently only "checkint" is recognised. Kept tiny on purpose — not
+// a real REPL.
+void pollSerialCmd() {
+  static String buf;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      buf.trim();
+      if (buf.equalsIgnoreCase("checkint") || buf.equalsIgnoreCase("i")) {
+        runIntPinCheck();
+      } else if (buf.length() > 0) {
+        Serial.print(F("[cmd] unknown: ")); Serial.println(buf);
+        Serial.println(F("[cmd] try: checkint"));
+      }
+      buf = "";
+    } else if (buf.length() < 24) {
+      buf += c;
+    } else {
+      buf = "";
+    }
+  }
 }
 
 // ── Battery sense ──────────────────────────────────────────────
@@ -1335,6 +1423,7 @@ void setup() {
 
 // ── Loop ───────────────────────────────────────────────────────
 void loop() {
+  pollSerialCmd();
   uint32_t now = millis();
 
   if (!sensorOk) {
